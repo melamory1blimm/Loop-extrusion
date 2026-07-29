@@ -152,7 +152,7 @@ def fit_one_fountain_matrix(
     major_tail_min_scale=0.25,
 
     # Peak anchor penalty
-    peak_penalty=True,
+    peak_penalty=False,
     peak_weight=100.0,
     peak_scale_kb=5.0,
     peak_search_window_kb=70,
@@ -1400,7 +1400,7 @@ def process_fountains_batch(cool_path, fountains_csv, output_csv='fountain_fit_r
     return (results_df, failed_df, expected_raw)
 
 
-def extract_fountain_Z(row, clr, matrix_selector, exp_cache, flank=200000, res=5000, z_transform='oe', require_full_window=True, base_shift_bp=-6000):
+def extract_fountain_Z(row, clr, matrix_selector, exp_cache, flank=200000, res=5000, z_transform='oe', require_full_window=True, base_shift_bp=0):
     """
     Достаёт окно вокруг одного фонтана и возвращает Z:
         Z = observed / expected
@@ -5554,13 +5554,13 @@ def build_numeric_fountain_kernel(
         Ac1 * gamma_b + A1b * gamma_field
     )
 
-    Nfin = A1c + Ac1 + A1b + Ab1 + Abb + Acc + Abc + Acb + A11
+    Nfin =  Abb + Acc + Abc + Acb + A11 +A1c + Ac1 + A1b + Ab1
 
     if kernel == "Nfin":
         A_kernel = Nfin
 
-    elif kernel == "A11":
-        A_kernel = A11
+    elif kernel == "blocked":
+        A_kernel = Abb + Acc
 
     elif kernel == "A11+A1c+Ac1":
         A_kernel = A11 + A1c + Ac1
@@ -8834,11 +8834,11 @@ def fit_numeric_fountain_coordinate_descent(
 
     # RMSE window
     rmse_orientation="upper",
-    rmse_center_xy_kb=(40, -40),
-    rmse_half_window_kb=40,
+    rmse_center_xy_kb=(60, -60),
+    rmse_half_window_kb=60,
 
     # peak-aware score params
-    peak_weight=3.0,
+    peak_weight=0,
     peak_search_window_kb=50,
     peak_scale_kb=20.0,
     peak_quantile=0.80,
@@ -8868,29 +8868,124 @@ def fit_numeric_fountain_coordinate_descent(
 
     if fixed_params is None:
         fixed_params = {}
+    else:
+        fixed_params = dict(fixed_params)
 
     if "gamma_ci" in fixed_params:
         fixed_params["gamma_c0"] = fixed_params.pop("gamma_ci")
 
-    allowed_fixed = {"lp_kb", "rho_sigma", "gamma_c0"}
+    allowed_fixed = {
+        "lp_kb",
+        "rho_sigma",
+        "rho_sigma_kb",
+        "gamma_c0",
+    }
+
     unknown = set(fixed_params) - allowed_fixed
     if unknown:
         raise ValueError(f"Unknown fixed parameter(s): {unknown}")
 
-    lp_min, lp_max = lp_bounds
-    rho_min, rho_max = rho_bounds
-    gamma_min, gamma_max = gamma_bounds
+    if (
+        "rho_sigma" in fixed_params
+        and "rho_sigma_kb" in fixed_params
+    ):
+        raise ValueError(
+            "Нельзя одновременно фиксировать "
+            "'rho_sigma' и 'rho_sigma_kb'."
+        )
 
-    if "lp_kb" in fixed_params:
-        lp_kb = float(fixed_params["lp_kb"])
+    lp_is_fixed = "lp_kb" in fixed_params
+    rho_sigma_is_fixed = (
+        "rho_sigma" in fixed_params
+        or "rho_sigma_kb" in fixed_params
+    )
+    gamma_is_fixed = "gamma_c0" in fixed_params
+
+    lp_min, lp_max = map(float, lp_bounds)
+    rho_min, rho_max = map(float, rho_bounds)
+    gamma_min, gamma_max = map(float, gamma_bounds)
+
+    if not lp_min < lp_max:
+        raise ValueError("lp_bounds должны задавать непустой интервал.")
+    if not 0 < rho_min < rho_max:
+        raise ValueError("rho_bounds должны удовлетворять 0 < min < max.")
+    if not gamma_min < gamma_max:
+        raise ValueError("gamma_bounds должны задавать непустой интервал.")
+
+    if lp_is_fixed:
+        lp_fixed = float(fixed_params["lp_kb"])
+        if not lp_min <= lp_fixed <= lp_max:
+            raise ValueError(
+                f"Фиксированное lp_kb={lp_fixed} выходит "
+                f"за lp_bounds={lp_bounds}."
+            )
+
     if "rho_sigma" in fixed_params:
-        rho_sigma = float(fixed_params["rho_sigma"])
-    if "gamma_c0" in fixed_params:
-        gamma_c0 = float(fixed_params["gamma_c0"])
+        rho_fixed = float(fixed_params["rho_sigma"])
+        if not rho_min <= rho_fixed <= rho_max:
+            raise ValueError(
+                f"Фиксированное rho_sigma={rho_fixed} выходит "
+                f"за rho_bounds={rho_bounds}."
+            )
 
-    lp_kb = float(np.clip(lp_kb, lp_min, lp_max))
-    rho_sigma = float(np.clip(rho_sigma, rho_min, rho_max))
-    gamma_c0 = float(np.clip(gamma_c0, gamma_min, gamma_max))
+    rho_sigma_kb_fixed = None
+    if "rho_sigma_kb" in fixed_params:
+        rho_sigma_kb_fixed = float(fixed_params["rho_sigma_kb"])
+        if not np.isfinite(rho_sigma_kb_fixed) or rho_sigma_kb_fixed <= 0:
+            raise ValueError("rho_sigma_kb должен быть положительным числом.")
+
+        # Область lp, в которой rho_sigma_kb / lp остаётся внутри rho_bounds.
+        feasible_lp_min = max(lp_min, rho_sigma_kb_fixed / rho_max)
+        feasible_lp_max = min(lp_max, rho_sigma_kb_fixed / rho_min)
+
+        if feasible_lp_min > feasible_lp_max:
+            raise ValueError(
+                "Для заданных rho_sigma_kb, lp_bounds и rho_bounds "
+                "нет допустимых значений lp_kb."
+            )
+
+        lp_min, lp_max = feasible_lp_min, feasible_lp_max
+
+        if lp_is_fixed and not lp_min <= lp_fixed <= lp_max:
+            raise ValueError(
+                f"При lp_kb={lp_fixed} фиксированная ширина "
+                f"rho_sigma_kb={rho_sigma_kb_fixed} kb даёт "
+                "rho_sigma вне rho_bounds."
+            )
+
+    if gamma_is_fixed:
+        gamma_fixed = float(fixed_params["gamma_c0"])
+        if not gamma_min <= gamma_fixed <= gamma_max:
+            raise ValueError(
+                f"Фиксированное gamma_c0={gamma_fixed} выходит "
+                f"за gamma_bounds={gamma_bounds}."
+            )
+
+    def constrain_params(lp, rho, gamma):
+        """Применяет границы и фиксированные параметры."""
+
+        if lp_is_fixed:
+            lp = float(fixed_params["lp_kb"])
+        lp = float(np.clip(lp, lp_min, lp_max))
+
+        if rho_sigma_kb_fixed is not None:
+            rho = rho_sigma_kb_fixed / lp
+        elif "rho_sigma" in fixed_params:
+            rho = float(fixed_params["rho_sigma"])
+        else:
+            rho = float(np.clip(rho, rho_min, rho_max))
+
+        if gamma_is_fixed:
+            gamma = float(fixed_params["gamma_c0"])
+        gamma = float(np.clip(gamma, gamma_min, gamma_max))
+
+        return lp, float(rho), gamma
+
+    lp_kb, rho_sigma, gamma_c0 = constrain_params(
+        lp_kb,
+        rho_sigma,
+        gamma_c0,
+    )
 
     history = []
     cache = {}
@@ -8928,19 +9023,21 @@ def fit_numeric_fountain_coordinate_descent(
     def make_candidates(lp, rho, gamma):
         candidates = [(lp, rho, gamma, "current")]
 
-        if "lp_kb" not in fixed_params:
+        if not lp_is_fixed:
             candidates.extend([
                 (lp + step_lp, rho, gamma, "+lp"),
                 (lp - step_lp, rho, gamma, "-lp"),
             ])
 
-        if "rho_sigma" not in fixed_params:
+        # Не двигаем rho, если фиксирован либо rho_sigma,
+        # либо физический rho_sigma_kb
+        if not rho_sigma_is_fixed:
             candidates.extend([
                 (lp, rho + step_rho, gamma, "+rho"),
                 (lp, rho - step_rho, gamma, "-rho"),
             ])
 
-        if "gamma_c0" not in fixed_params:
+        if not gamma_is_fixed:
             candidates.extend([
                 (lp, rho, gamma + step_gamma, "+gamma"),
                 (lp, rho, gamma - step_gamma, "-gamma"),
@@ -8950,16 +9047,12 @@ def fit_numeric_fountain_coordinate_descent(
         seen = set()
 
         for lp_try, rho_try, gamma_try, move_name in candidates:
-            lp_try = float(np.clip(lp_try, lp_min, lp_max))
-            rho_try = float(np.clip(rho_try, rho_min, rho_max))
-            gamma_try = float(np.clip(gamma_try, gamma_min, gamma_max))
 
-            if "lp_kb" in fixed_params:
-                lp_try = float(fixed_params["lp_kb"])
-            if "rho_sigma" in fixed_params:
-                rho_try = float(fixed_params["rho_sigma"])
-            if "gamma_c0" in fixed_params:
-                gamma_try = float(fixed_params["gamma_c0"])
+            lp_try, rho_try, gamma_try = constrain_params(
+                lp_try,
+                rho_try,
+                gamma_try,
+            )
 
             key = (
                 round(lp_try, 6),
@@ -8969,7 +9062,9 @@ def fit_numeric_fountain_coordinate_descent(
 
             if key not in seen:
                 seen.add(key)
-                out.append((lp_try, rho_try, gamma_try, move_name))
+                out.append(
+                    (lp_try, rho_try, gamma_try, move_name)
+                )
 
         return out
 
@@ -9035,7 +9130,15 @@ def fit_numeric_fountain_coordinate_descent(
 
             log(f"{prefix} kernel built in {fmt_time(t0)}", level=2)
 
-            A_kernel = kernel_res["Nfin"].copy()
+            if "A_kernel" not in kernel_res:
+                raise KeyError(
+                    "build_numeric_fountain_kernel должен вернуть "
+                    "ключ 'A_kernel'."
+                )
+            A_kernel = np.asarray(
+                kernel_res["A_kernel"],
+                dtype=float,
+            ).copy()
 
             log(
                 f"{prefix} build contact map: "
@@ -9396,12 +9499,15 @@ def fit_numeric_fountain_coordinate_descent(
             )
 
         else:
-            step_lp *= shrink
-            step_rho *= shrink
-            step_gamma *= shrink
+            if not lp_is_fixed:
+                step_lp *= shrink
+            if not rho_sigma_is_fixed:
+                step_rho *= shrink
+            if not gamma_is_fixed:
+                step_gamma *= shrink
 
             log(
-                "\nNO IMPROVEMENT -> shrink steps: "
+                "\nNO IMPROVEMENT -> shrink active steps: "
                 f"step_lp={step_lp:.4g}, "
                 f"step_rho={step_rho:.4g}, "
                 f"step_gamma={step_gamma:.4g}"
@@ -9410,12 +9516,12 @@ def fit_numeric_fountain_coordinate_descent(
         log(f"iteration time: {fmt_time(t_iter)}")
         log(f"elapsed total: {fmt_time(t_global)}")
 
-        if (
-            step_lp <= min_step_lp
-            and step_rho <= min_step_rho
-            and step_gamma <= min_step_gamma
-        ):
-            log("\nSTOP: steps are small enough.")
+        lp_converged = lp_is_fixed or step_lp <= min_step_lp
+        rho_converged = rho_sigma_is_fixed or step_rho <= min_step_rho
+        gamma_converged = gamma_is_fixed or step_gamma <= min_step_gamma
+
+        if lp_converged and rho_converged and gamma_converged:
+            log("\nSTOP: active steps are small enough.")
             break
 
     history_df = pd.DataFrame(history)
