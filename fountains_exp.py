@@ -411,7 +411,7 @@ fit_agg, fit_cache = ft.fit_aggregate_fountain_old(
     p0_kb=50,
     p_half_window_kb=40,
 
-    peak_penalty=True,
+    peak_penalty=False,
     peak_weight=30.0,
     peak_scale_kb=30.0,
     peak_search_window_kb=70,
@@ -993,9 +993,9 @@ plt.show()
 # ----------------------------
 # начальная точка
 # ----------------------------
-lp_kb = 2300.0
-rho_sigma = 0.017
-gamma_ci = 10
+lp_kb = 500.0
+rho_sigma = 0.01
+gamma_ci = 5
 
 # ----------------------------
 # начальные шаги поиска
@@ -1014,7 +1014,7 @@ gamma_min, gamma_max = 0.0, 40.0
 # ----------------------------
 # peak-aware score params
 # ----------------------------
-peak_weight = 3.0          # сила штрафа за промах по пику; можно поднять до 5-10
+peak_weight = 0          # сила штрафа за промах по пику; можно поднять до 5-10
 peak_search_window_kb = 50 # окно, где ищем пик вокруг ожидаемого положения
 peak_scale_kb = 20.0       # промах на 20 kb дает штраф порядка peak_weight
 peak_quantile = 0.80       # берем верхние 20% сигнала как "верхушку" пика
@@ -1318,7 +1318,7 @@ for gamma_value in gamma_grid:
         flank_kb=flank_kb,
         res_agg=res_agg,
 
-        lp_kb=1700.0,
+        lp_kb=500.0,
         rho_sigma=0.01,
         gamma_c0=gamma_value,
         min_step_lp=100.0,
