@@ -10,6 +10,8 @@ The code includes:
 
 - stochastic simulations of one-sided and two-sided loop extrusion;
 - steric interactions between neighboring cohesins and transient obstacles;
+- fitting of experimental CTCF- and cohesin-associated loop-length distributions;
+- grid-based estimation of loop-extrusion model parameters;
 - construction of aggregate Hi-C fountains;
 - anisotropic Gaussian fitting of fountain geometry;
 - numerical fitting of a mechanistic loop-extrusion model;
@@ -25,6 +27,8 @@ The code includes:
 ├── fountain_tools_clean.py
 
 ├── fountains_exp.py
+
+├── 
 
 └── README.md
 
@@ -49,6 +53,9 @@ Core analysis library containing functions for:
 Analysis workflow used to process experimental Hi-C data, construct aggregate fountains, fit the Gaussian and mechanistic models, and generate the corresponding figures.
 
 Dataset paths and analysis parameters should be adjusted before running the script.
+
+### `loops_fitting.nb`
+The fitting of parameters of loop-length distribution by theoretical distributions
 
 ---
 
