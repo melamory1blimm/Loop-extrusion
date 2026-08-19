@@ -15,7 +15,6 @@ The code includes:
 - estimation of correlations between the two extruded loop arms;
 - enhancer and promoter annotation around fountain bases.
 - stochastic simulations of one-sided and two-sided loop extrusion;
-- steric interactions between neighboring cohesins and transient obstacles;
 
 ---
 
