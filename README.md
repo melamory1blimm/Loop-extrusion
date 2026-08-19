@@ -8,15 +8,14 @@ This repository provides computational tools for modeling cohesin-mediated loop 
 
 The code includes:
 
-- stochastic simulations of one-sided and two-sided loop extrusion;
-- steric interactions between neighboring cohesins and transient obstacles;
 - fitting of experimental CTCF- and cohesin-associated loop-length distributions;
-- grid-based estimation of loop-extrusion model parameters;
 - construction of aggregate Hi-C fountains;
 - anisotropic Gaussian fitting of fountain geometry;
 - numerical fitting of a mechanistic loop-extrusion model;
 - estimation of correlations between the two extruded loop arms;
 - enhancer and promoter annotation around fountain bases.
+- stochastic simulations of one-sided and two-sided loop extrusion;
+- steric interactions between neighboring cohesins and transient obstacles;
 
 ---
 
