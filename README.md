@@ -26,7 +26,7 @@ The code includes:
 
 ├── fountains_exp.py
 
-├── 
+├── loop_fitting.nb
 
 └── README.md
 
