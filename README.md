@@ -8,12 +8,12 @@ This repository provides computational tools for modeling cohesin-mediated loop 
 
 The code includes:
 
-- fitting of experimental CTCF- and cohesin-associated loop-length distributions;
+- analysis of experimental CTCF- and cohesin-associated loop-length distributions;
 - construction of aggregate Hi-C fountains;
 - anisotropic Gaussian fitting of fountain geometry;
-- numerical fitting of a mechanistic loop-extrusion model;
-- estimation of correlations between the two extruded loop arms;
-- enhancer and promoter annotation around fountain bases.
+- numerical fitting of a mechanistic loop-extrusion model to Hi-C fountains;
+- estimation of correlations between the two extruded arms;
+- enhancer annotation around fountain bases;
 - stochastic simulations of one-sided and two-sided loop extrusion;
 
 ---
