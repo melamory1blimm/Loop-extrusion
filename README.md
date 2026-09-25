@@ -50,7 +50,7 @@ Core analysis library containing functions for:
 
 ### `xenopus_tropicalis_enh.py`
 
-- enhancer-promoter annotation for Xenopus tropicalis
+Enhancer-promoter annotation for Xenopus tropicalis
 
 ### `fountains_exp.py`
 
