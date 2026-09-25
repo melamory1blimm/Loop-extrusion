@@ -26,6 +26,8 @@ The code includes:
 
 ├── fountains_exp.py
 
+├── xenopus_tropicalis_enh.py
+
 ├── loop_fitting.nb
 
 └── README.md
@@ -44,7 +46,11 @@ Core analysis library containing functions for:
 - Gaussian and numerical model fitting;
 - calculation of fountain geometry and arm correlations;
 - visualization of fitted models;
-- enhancer–promoter annotation and analysis.
+- enhancer–promoter analysis.
+
+### `xenopus_tropicalis_enh.py`
+
+- enhancer-promoter annotation for Xenopus tropicalis
 
 ### `fountains_exp.py`
 
