@@ -7,59 +7,41 @@
 This repository provides computational tools for modeling cohesin-mediated loop extrusion and analyzing fountain-shaped patterns in Hi-C contact maps.
 
 The code includes:
-
-- analysis of experimental CTCF- and cohesin-associated loop-length distributions;
-- construction of aggregate Hi-C fountains;
-- anisotropic Gaussian fitting of fountain geometry;
-- numerical fitting of a mechanistic loop-extrusion model to Hi-C fountains;
-- estimation of correlations between the two extruded arms;
-- enhancer annotation around fountain bases;
-- stochastic simulations of one-sided and two-sided loop extrusion;
+- theoretical analysis of one-sided, two-sided, and Poisson-switching loop extrusion;
+- calculation of loop-length distributions and constraints on the switching length;
+- stochastic simulations of cohesin extrusion with chromatin barriers and cohesin–cohesin encounters;
+- construction of aggregate Hi-C fountains for three vertebrate species;
+- anisotropic Gaussian characterization of fountain geometry and bootstrap analysis;
+- estimation of correlations between the two extruded arms, including direct empirical estimates.
 
 ---
 
 ## Repository Structure
 
-├── extrusion_sim.py
-
+├── cohesin_simulator_state_diagnostics.py
+├── model_of_switching_poisson_v2.nb
+├── fountain_exp.py
 ├── fountain_tools_clean.py
-
-├── fountains_exp.py
-
-├── xenopus_tropicalis_enh.py
-
-├── loop_fitting.nb
-
+├── extrusion_sim.py                 # older version
+├── fountains_exp.py                 # older version
+├── loop fitting.nb                  # older notebook
+├── xenopus_tropicalis_enh.py        # separate analysis
 └── README.md
 
 
-### `extrusion_sim.py`
-
-Stochastic simulation of loop extrusion by multiple cohesin complexes. The script supports one-sided and two-sided extrusion and accounts for steric blocking between neighboring loops.
-
-### `fountain_tools_clean.py`
-
-Core analysis library containing functions for:
-
+### cohesin_simulator_state_diagnostics.py
+Stochastic simulation of cohesin-mediated loop extrusion. The script supports one-sided, two-sided, and directional-switching extrusion, accounts for blocking by chromatin barriers and neighboring cohesins, and provides state-resolved diagnostics for comparison with analytical predictions.
+### model_of_switching_poisson_v2.nb
+Wolfram Mathematica notebook implementing the theoretical model of Poisson switching between active extrusion arms. It calculates loop-length distributions and analyzes the dependence of their peaks on the characteristic switching length.
+### fountain_exp.py
+Current experimental Hi-C fountain analysis for Oryzias latipes, Xenopus tropicalis, and Danio rerio. The script constructs aggregate fountains, fits anisotropic Gaussian profiles, estimates arm correlations, performs bootstrap and fitting-window analyses, and generates figures and tables for the manuscript. Dataset paths and analysis parameters can be specified when running the script.
+### fountain_tools_clean.py
+Core analysis library used by fountain_exp.py, containing functions for:
 - extraction and aggregation of Hi-C fountain maps;
 - observed/expected normalization;
-- Gaussian and numerical model fitting;
-- calculation of fountain geometry and arm correlations;
-- visualization of fitted models;
-- enhancer–promoter analysis.
-
-### `xenopus_tropicalis_enh.py`
-
-Enhancer-promoter annotation for Xenopus tropicalis
-
-### `fountains_exp.py`
-
-Analysis workflow used to process experimental Hi-C data, construct aggregate fountains, fit the Gaussian and mechanistic models, and generate the corresponding figures.
-
-Dataset paths and analysis parameters should be adjusted before running the script.
-
-### `loops_fitting.nb`
-The fitting of parameters of loop-length distribution by theoretical distributions
+- Gaussian fitting of fountain geometry;
+- empirical arm-correlation calculations and bootstrap analysis;
+- visualization of experimental fountains and fitted profiles.
 
 ---
 
@@ -102,6 +84,6 @@ python fountains_exp.py
 
 Before running, specify the paths to the Hi-C maps, fountain coordinates, and genomic annotations.
 
-The simulation parameters in `extrusion_sim.py` can be modified to compare different extrusion mechanisms, cohesin densities, lifetimes, and obstacle densities.
+The simulation parameters can be modified to compare different extrusion mechanisms, cohesin densities, lifetimes, and obstacle densities.
 
 ---
