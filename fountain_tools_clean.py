@@ -26,6 +26,10 @@ import cooltools
 from tqdm.auto import tqdm
 from matplotlib.lines import Line2D
 
+from matplotlib.colors import Normalize
+
+
+from scipy.optimize import curve_fit
 
 def load_fountains_csv(path, sep=';'):
     df = pd.read_csv(path, sep=sep)
@@ -1504,7 +1508,7 @@ def harmonize_fountain_chroms_to_cooler(fountains, clr, chrom_col='chrom'):
     return out
 
 
-def build_weighted_aggregate_fountain(cool_path, fountains_csv, flank=300000, res=10000, weight_col='Fountain Score', z_transform='oe', expected_nproc=1, min_weight=0, require_full_window=True, base_shift_bp=-6000):
+def build_weighted_aggregate_fountain(cool_path, fountains_csv = None, fountains_df = None, flank=300000, res=10000, weight_col='Fountain Score', z_transform='oe', expected_nproc=1, min_weight=0, require_full_window=True, base_shift_bp=0):
     """
     Строит агрегированный фонтан:
 
@@ -1520,7 +1524,10 @@ def build_weighted_aggregate_fountain(cool_path, fountains_csv, flank=300000, re
         expected_raw
     """
     clr = cooler.Cooler(f'{cool_path}::resolutions/{res}')
-    fountains = load_fountains_csv(fountains_csv)
+    if fountains_csv is not None:
+        fountains = load_fountains_csv(fountains_csv)
+    else: 
+        fountains = fountains_df
     fountains = harmonize_fountain_chroms_to_cooler(fountains, clr)
     if 'base_bp' not in fountains.columns:
         fountains['base_bp'] = (fountains['start'].astype(int) + fountains['end'].astype(int)) // 2
@@ -1760,6 +1767,14 @@ def fit_aggregate_fountain_old(
     major_tail_start_kb=20,
     major_tail_transition_kb=40,
     major_tail_min_scale=0.50,
+    
+    # Full-map NRMSE diagnostics
+    compute_full_nrmse=True,
+    full_nrmse_normalization="range",
+    full_nrmse_q_low=0.05,
+    full_nrmse_q_high=0.995,
+    full_nrmse_exclude_diagonal=False,
+    full_nrmse_mirror=False,
 
     # Peak-aware penalty
     peak_penalty=True,
@@ -1817,6 +1832,35 @@ def fit_aggregate_fountain_old(
         peak_center_kb=peak_center_kb,
         peak_min_points=peak_min_points,
     )
+    if compute_full_nrmse:
+        pred_full = gaussian_prediction_from_fit_full_grid(
+            fit=fit,
+            fit_cache=fit_cache,
+            n=np.asarray(aggregate_Z).shape[0],
+            mirror=full_nrmse_mirror,
+        )
+
+        full_stats = calculate_full_map_nrmse(
+            observed=aggregate_Z,
+            predicted=pred_full,
+            normalization=full_nrmse_normalization,
+            q_low=full_nrmse_q_low,
+            q_high=full_nrmse_q_high,
+            exclude_diagonal=full_nrmse_exclude_diagonal,
+        )
+
+        fit.update(
+            {
+                "nrmse_full": full_stats["nrmse"],
+                "rmse_full": full_stats["rmse"],
+                "mae_full": full_stats["mae"],
+                "nrmse_full_denominator": full_stats["denominator"],
+                "n_pixels_full_nrmse": full_stats["n_pixels"],
+                "nrmse_full_normalization": full_nrmse_normalization,
+                "nrmse_full_mirror": bool(full_nrmse_mirror),
+                "nrmse_full_exclude_diagonal": bool(full_nrmse_exclude_diagonal),
+            }
+        )
 
     return fit, fit_cache
     
@@ -2075,7 +2119,7 @@ def plot_aggregate_fountain_fit(
     image_vmin=None,
     image_vmax=None,
     cmap="coolwarm",
-    figsize=(6, 6),
+    figsize=(6.5, 5.8),
     output=None,
     dpi=300,
 
@@ -2106,90 +2150,184 @@ def plot_aggregate_fountain_fit(
     fit_contour_linewidth=1.5,
     fit_contour_linestyle="--",
     label_fit_contours=False,
-    show_fit_contours_mirror=True,   # <--- добавить
+    show_fit_contours_mirror=True,
+
+    # NEW: fine grid only for Gaussian contour rendering
+    gaussian_plot_upsample=8,
 
     # guides
     show_diagonals=True,
     title=None,
     colorbar_label="Hi-C intensity",
+
+    # axis ticks
+    tick_fontsize=12,
+    x_tick_step=None,
+    y_tick_step=None,
+
+    # colorbar ticks
+    colorbar_tick_fontsize=10,
+    colorbar_tick_step=None,
+    
+    xlim=None,
+    ylim=None,
 ):
     """
-    Рисует агрегированный фонтан и контуры.
+    Plot aggregate Hi-C fountain and fitted Gaussian contours.
 
-    Если normalize_contours=True, то Hi-C и Gaussian fit
-    сначала независимо нормируются в 0..1 по одной и той же маске,
-    а затем рисуются с common_contour_levels.
+    Important
+    ---------
+    gaussian_plot_upsample controls ONLY how smoothly the fitted
+    analytical Gaussian is rendered. It does not refit the Gaussian
+    and does not change a, b, p, A or C.
+
+    gaussian_plot_upsample=1:
+        Gaussian contours on original Hi-C grid.
+
+    gaussian_plot_upsample=8:
+        Gaussian evaluated on an 8x denser plotting grid,
+        giving smooth elliptical contours.
     """
+
+    from matplotlib.ticker import MultipleLocator
+
+    # ============================================================
+    # Helpers
+    # ============================================================
 
     def _valid_levels(F, levels):
         levels = np.asarray(levels, dtype=float)
+
+        if F is None or levels.size == 0:
+            return np.array([])
+
         fmin = np.nanmin(F)
         fmax = np.nanmax(F)
-        return np.sort(levels[(levels > fmin) & (levels < fmax)])
 
-    def _make_norm_mask(X, Y, orientation="upper", window_kb=None):
+        return np.sort(
+            levels[
+                (levels > fmin)
+                & (levels < fmax)
+            ]
+        )
+
+    def _make_norm_mask(
+        X,
+        Y,
+        orientation="upper",
+        window_kb=None,
+    ):
         if orientation == "upper":
             mask = (X >= 0) & (Y <= 0)
+
         elif orientation == "lower":
             mask = (X <= 0) & (Y >= 0)
+
         elif orientation == "both":
-            mask = ((X >= 0) & (Y <= 0)) | ((X <= 0) & (Y >= 0))
+            mask = (
+                ((X >= 0) & (Y <= 0))
+                | ((X <= 0) & (Y >= 0))
+            )
+
         elif orientation is None:
             mask = np.ones_like(X, dtype=bool)
+
         else:
             raise ValueError(
-                "contour_norm_orientation должен быть 'upper', 'lower', 'both' или None."
+                "contour_norm_orientation must be "
+                "'upper', 'lower', 'both' or None."
             )
 
         if window_kb is not None:
-            mask = (
-                mask
-                & (np.abs(X) <= window_kb)
+            mask &= (
+                (np.abs(X) <= window_kb)
                 & (np.abs(Y) <= window_kb)
             )
 
         return mask
 
-    def _normalize01(F, mask=None, q_low=0.05, q_high=0.995):
+    def _normalize01(
+        F,
+        mask=None,
+        q_low=0.05,
+        q_high=0.995,
+    ):
         F = np.asarray(F, dtype=float)
 
         if mask is None:
             vals = F[np.isfinite(F)]
         else:
-            vals = F[np.isfinite(F) & mask]
+            vals = F[
+                np.isfinite(F)
+                & mask
+            ]
 
-        if len(vals) == 0:
+        if vals.size == 0:
             return np.full_like(F, np.nan)
 
         lo = np.nanquantile(vals, q_low)
         hi = np.nanquantile(vals, q_high)
 
-        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        if (
+            not np.isfinite(lo)
+            or not np.isfinite(hi)
+            or hi <= lo
+        ):
             return np.full_like(F, np.nan)
 
         out = (F - lo) / (hi - lo)
-        out = np.clip(out, 0.0, 1.0)
 
-        return out
+        return np.clip(
+            out,
+            0.0,
+            1.0,
+        )
 
-    # ------------------------------------------------------------
-    # Coordinates
-    # ------------------------------------------------------------
+    # ============================================================
+    # Coordinates of original Hi-C grid
+    # ============================================================
 
-    Z = np.asarray(aggregate_Z, dtype=float)
+    Z = np.asarray(
+        aggregate_Z,
+        dtype=float,
+    )
+
     n = Z.shape[0]
 
     ctx = fit_cache.get(n)
 
-    if "X" in ctx and "Y" in ctx:
-        X = ctx["X"]
-        Y = ctx["Y"]
-        x_kb = ctx.get("x_kb", X[0, :])
-        y_kb = ctx.get("y_kb", Y[:, 0])
+    if (
+        "X" in ctx
+        and "Y" in ctx
+    ):
+        X = np.asarray(ctx["X"], dtype=float)
+        Y = np.asarray(ctx["Y"], dtype=float)
+
+        x_kb = np.asarray(
+            ctx.get("x_kb", X[0, :]),
+            dtype=float,
+        )
+
+        y_kb = np.asarray(
+            ctx.get("y_kb", Y[:, 0]),
+            dtype=float,
+        )
+
     else:
-        x_kb = ctx["x_kb"]
-        y_kb = ctx["y_kb"]
-        X, Y = np.meshgrid(x_kb, y_kb)
+        x_kb = np.asarray(
+            ctx["x_kb"],
+            dtype=float,
+        )
+
+        y_kb = np.asarray(
+            ctx["y_kb"],
+            dtype=float,
+        )
+
+        X, Y = np.meshgrid(
+            x_kb,
+            y_kb,
+        )
 
     extent = [
         x_kb.min(),
@@ -2198,11 +2336,13 @@ def plot_aggregate_fountain_fit(
         y_kb.min(),
     ]
 
-    # ------------------------------------------------------------
+    # ============================================================
     # Base heatmap
-    # ------------------------------------------------------------
+    # ============================================================
 
-    fig, ax = plt.subplots(figsize=figsize)
+    fig, ax = plt.subplots(
+        figsize=figsize
+    )
 
     im = ax.imshow(
         Z,
@@ -2216,45 +2356,132 @@ def plot_aggregate_fountain_fit(
         zorder=0,
     )
 
-    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    #cbar.set_label(colorbar_label, fontsize=11)
+    # ============================================================
+    # Colorbar
+    # ============================================================
 
-    # ------------------------------------------------------------
-    # Prepare Hi-C contour field
-    # ------------------------------------------------------------
+    cbar = plt.colorbar(
+        im,
+        ax=ax,
+        fraction=0.046,
+        pad=0.04,
+    )
+
+    cbar.ax.tick_params(
+        labelsize=colorbar_tick_fontsize
+    )
+
+    if colorbar_tick_step is not None:
+
+        if cbar.orientation == "vertical":
+            cbar.ax.yaxis.set_major_locator(
+                MultipleLocator(
+                    colorbar_tick_step
+                )
+            )
+
+        else:
+            cbar.ax.xaxis.set_major_locator(
+                MultipleLocator(
+                    colorbar_tick_step
+                )
+            )
+
+    # If needed:
+    # cbar.set_label(
+    #     colorbar_label,
+    #     fontsize=colorbar_tick_fontsize
+    # )
+
+    # ============================================================
+    # Hi-C contour field
+    # ============================================================
 
     Z_hic = Z.copy()
+
     finite = np.isfinite(Z_hic)
 
     if np.any(finite):
-        med = np.nanmedian(Z_hic[finite])
+        med = np.nanmedian(
+            Z_hic[finite]
+        )
     else:
         med = 0.0
 
     Z_hic[~finite] = med
 
-    if hic_contour_smooth_sigma is not None and hic_contour_smooth_sigma > 0:
-        Z_hic = gaussian_filter(Z_hic, sigma=hic_contour_smooth_sigma)
-
-    # ------------------------------------------------------------
-    # Prepare Gaussian model
-    # ------------------------------------------------------------
-
-    gaussian_model = None
-
-    if fit is not None:
-        gaussian_model = gaussian_fountain_from_fit_on_grid(
-            gaussian_fit=fit,
-            X=X,
-            Y=Y,
+    if (
+        hic_contour_smooth_sigma is not None
+        and hic_contour_smooth_sigma > 0
+    ):
+        Z_hic = gaussian_filter(
+            Z_hic,
+            sigma=hic_contour_smooth_sigma,
         )
 
-    # ------------------------------------------------------------
-    # Unified contour normalization
-    # ------------------------------------------------------------
+    # ============================================================
+    # Fine plotting grid for Gaussian
+    # ============================================================
+
+    gaussian_plot_upsample = max(
+        1,
+        int(gaussian_plot_upsample),
+    )
+
+    gaussian_model = None
+    X_gauss = None
+    Y_gauss = None
+
+    if fit is not None:
+
+        nx_gauss = (
+            (len(x_kb) - 1)
+            * gaussian_plot_upsample
+            + 1
+        )
+
+        ny_gauss = (
+            (len(y_kb) - 1)
+            * gaussian_plot_upsample
+            + 1
+        )
+
+        x_gauss = np.linspace(
+            x_kb.min(),
+            x_kb.max(),
+            nx_gauss,
+        )
+
+        y_gauss = np.linspace(
+            y_kb.min(),
+            y_kb.max(),
+            ny_gauss,
+        )
+
+        X_gauss, Y_gauss = np.meshgrid(
+            x_gauss,
+            y_gauss,
+        )
+
+        # IMPORTANT:
+        # analytical Gaussian evaluated directly
+        # on the dense grid — no interpolation
+        gaussian_model = (
+            gaussian_fountain_from_fit_on_grid(
+                gaussian_fit=fit,
+                X=X_gauss,
+                Y=Y_gauss,
+            )
+        )
+
+    # ============================================================
+    # Contour normalization
+    # ============================================================
 
     if normalize_contours:
-        norm_mask = _make_norm_mask(
+
+        # Hi-C normalization mask on native grid
+        norm_mask_hic = _make_norm_mask(
             X,
             Y,
             orientation=contour_norm_orientation,
@@ -2263,18 +2490,28 @@ def plot_aggregate_fountain_fit(
 
         Z_hic_for_contour = _normalize01(
             Z_hic,
-            mask=norm_mask,
+            mask=norm_mask_hic,
             q_low=contour_norm_q_low,
             q_high=contour_norm_q_high,
         )
 
+        # Gaussian normalization mask on fine grid
         if gaussian_model is not None:
+
+            norm_mask_gauss = _make_norm_mask(
+                X_gauss,
+                Y_gauss,
+                orientation=contour_norm_orientation,
+                window_kb=contour_norm_window_kb,
+            )
+
             gaussian_for_contour = _normalize01(
                 gaussian_model,
-                mask=norm_mask,
+                mask=norm_mask_gauss,
                 q_low=contour_norm_q_low,
                 q_high=contour_norm_q_high,
             )
+
         else:
             gaussian_for_contour = None
 
@@ -2283,52 +2520,90 @@ def plot_aggregate_fountain_fit(
             norm_hic_levels,
         )
 
-        fit_levels_use = (
-            _valid_levels(gaussian_for_contour, norm_gaussian_levels)
-            if gaussian_for_contour is not None
-            else np.array([])
+        fit_levels_use = _valid_levels(
+            gaussian_for_contour,
+            norm_gaussian_levels,
         )
 
+    # ============================================================
+    # No contour normalization
+    # ============================================================
+
     else:
+
         Z_hic_for_contour = Z_hic
         gaussian_for_contour = gaussian_model
 
+        # Hi-C levels
         if hic_contour_levels is None:
-            vals = Z_hic[np.isfinite(Z_hic)]
-            hic_levels_use = np.quantile(vals, hic_contour_quantiles)
+
+            vals = Z_hic[
+                np.isfinite(Z_hic)
+            ]
+
+            hic_levels_use = np.quantile(
+                vals,
+                hic_contour_quantiles,
+            )
+
         else:
-            hic_levels_use = np.asarray(hic_contour_levels, dtype=float)
+            hic_levels_use = np.asarray(
+                hic_contour_levels,
+                dtype=float,
+            )
 
-        hic_levels_use = _valid_levels(Z_hic_for_contour, hic_levels_use)
+        hic_levels_use = _valid_levels(
+            Z_hic_for_contour,
+            hic_levels_use,
+        )
 
+        # Gaussian levels
         if gaussian_model is not None:
+
             if fit_contour_levels is not None:
-                fit_levels_use = np.asarray(fit_contour_levels, dtype=float)
+
+                fit_levels_use = np.asarray(
+                    fit_contour_levels,
+                    dtype=float,
+                )
+
             else:
+
                 A = float(
                     fit.get(
                         "A",
-                        np.nanmax(gaussian_model) - np.nanmin(gaussian_model),
+                        np.nanmax(gaussian_model)
+                        - np.nanmin(gaussian_model),
                     )
                 )
+
                 C = float(
                     fit.get(
                         "C",
                         np.nanmin(gaussian_model),
                     )
                 )
-                fit_levels_use = C + A * np.asarray(
-                    fit_contour_fractions,
-                    dtype=float,
+
+                fit_levels_use = (
+                    C
+                    + A
+                    * np.asarray(
+                        fit_contour_fractions,
+                        dtype=float,
+                    )
                 )
 
-            fit_levels_use = _valid_levels(gaussian_model, fit_levels_use)
+            fit_levels_use = _valid_levels(
+                gaussian_model,
+                fit_levels_use,
+            )
+
         else:
             fit_levels_use = np.array([])
 
-    # ------------------------------------------------------------
-    # Gaussian contours
-    # ------------------------------------------------------------
+    # ============================================================
+    # Gaussian contours — FINE GRID
+    # ============================================================
 
     fit_cs = None
     fit_cs_mirror = None
@@ -2338,10 +2613,11 @@ def plot_aggregate_fountain_fit(
         and gaussian_for_contour is not None
         and len(fit_levels_use) > 0
     ):
-        # основной гауссовский фит
+
+        # Original fitted Gaussian
         fit_cs = ax.contour(
-            X,
-            Y,
+            X_gauss,
+            Y_gauss,
             gaussian_for_contour,
             levels=fit_levels_use,
             colors=fit_contour_color,
@@ -2350,14 +2626,13 @@ def plot_aggregate_fountain_fit(
             zorder=20,
         )
 
-        # отражение относительно главной диагонали y = x
+        # Mirror across y = x
         if show_fit_contours_mirror:
-            gaussian_for_contour_mirror = gaussian_for_contour.T
 
             fit_cs_mirror = ax.contour(
-                X,
-                Y,
-                gaussian_for_contour_mirror,
+                Y_gauss.T,
+                X_gauss.T,
+                gaussian_for_contour.T,
                 levels=fit_levels_use,
                 colors=fit_contour_color,
                 linewidths=fit_contour_linewidth,
@@ -2366,17 +2641,34 @@ def plot_aggregate_fountain_fit(
             )
 
         if label_fit_contours:
-            ax.clabel(fit_cs, inline=True, fontsize=8, fmt="%.2f")
-            if fit_cs_mirror is not None:
-                ax.clabel(fit_cs_mirror, inline=True, fontsize=8, fmt="%.2f")
 
-    # ------------------------------------------------------------
-    # Hi-C contours
-    # ------------------------------------------------------------
+            ax.clabel(
+                fit_cs,
+                inline=True,
+                fontsize=8,
+                fmt="%.2f",
+            )
+
+            if fit_cs_mirror is not None:
+
+                ax.clabel(
+                    fit_cs_mirror,
+                    inline=True,
+                    fontsize=8,
+                    fmt="%.2f",
+                )
+
+    # ============================================================
+    # Hi-C contours — ORIGINAL GRID
+    # ============================================================
 
     hic_cs = None
 
-    if show_hic_contours and len(hic_levels_use) > 0:
+    if (
+        show_hic_contours
+        and len(hic_levels_use) > 0
+    ):
+
         hic_cs = ax.contour(
             X,
             Y,
@@ -2389,15 +2681,20 @@ def plot_aggregate_fountain_fit(
         )
 
         if label_hic_contours:
-            ax.clabel(hic_cs, inline=True, fontsize=8, fmt="%.2f")
 
+            ax.clabel(
+                hic_cs,
+                inline=True,
+                fontsize=8,
+                fmt="%.2f",
+            )
 
-
-    # ------------------------------------------------------------
+    # ============================================================
     # Guides
-    # ------------------------------------------------------------
+    # ============================================================
 
     if show_diagonals:
+
         ax.axline(
             (0, 0),
             slope=1,
@@ -2407,6 +2704,7 @@ def plot_aggregate_fountain_fit(
             alpha=0.5,
             zorder=30,
         )
+
         ax.axline(
             (0, 0),
             slope=-1,
@@ -2417,27 +2715,79 @@ def plot_aggregate_fountain_fit(
             zorder=30,
         )
 
-    #ax.set_xlabel("Distance from fountain base, kb")
-    #ax.set_ylabel("Distance from fountain base, kb")
+    # ============================================================
+    # Title
+    # ============================================================
 
     if title is None:
-        if normalize_contours:
-            title = "Aggregated fountain and Gaussian fit, normalized contours"
-        else:
-            title = "Aggregated fountain and Gaussian fit"
 
-    #ax.set_title(title)
+        if normalize_contours:
+            title = (
+                "Aggregated fountain and Gaussian fit, "
+                "normalized contours"
+            )
+
+        else:
+            title = (
+                "Aggregated fountain and Gaussian fit"
+            )
+
+    # Keep disabled as in your previous version:
+    # ax.set_title(title)
+
+    # ============================================================
+    # Axis ticks
+    # ============================================================
+
+    ax.tick_params(
+        axis="both",
+        which="major",
+        labelsize=tick_fontsize,
+    )
+
+    if x_tick_step is not None:
+        ax.xaxis.set_major_locator(
+            MultipleLocator(
+                x_tick_step
+            )
+        )
+
+    if y_tick_step is not None:
+        ax.yaxis.set_major_locator(
+            MultipleLocator(
+                y_tick_step
+            )
+        )
+    
+    # ============================================================
+    # Optional plotting window
+    # ============================================================
+
+    if xlim is not None:
+        ax.set_xlim(*xlim)
+
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+
+    # ============================================================
+    # Final layout
+    # ============================================================
 
     plt.tight_layout()
 
     if output is not None:
-        fig.savefig(output, dpi=dpi, bbox_inches="tight")
+        fig.savefig(
+            output,
+            dpi=dpi,
+            bbox_inches="tight",
+        )
 
     return fig, ax
 
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
+
 
 def plot_smoothed_hic_contours(
     aggregate_Z,
@@ -2451,9 +2801,31 @@ def plot_smoothed_hic_contours(
     linewidth=1.5,
     show_image=True,
     figsize=(6, 6),
+
+    # new options
+    restrict_contours_to_largest_component=False,
+    component_baseline=1.0,
+    component_from_smoothed=True,
+    component_connectivity=2,
+    component_window_kb=None,
+    component_diag_exclusion_kb=None,
+    show_component_boundary=True,
+    component_boundary_color="magenta",
+    component_boundary_linewidth=2.2,
+    component_boundary_linestyle="-",
+    shade_component=False,
+    component_fill_color="magenta",
+    component_fill_alpha=0.08,
+    drop_levels_below_component_baseline=True,
+    return_component_info=False,
 ):
     """
     Рисует линии уровня для агрегированного фонтана после Gaussian smoothing.
+
+    Если restrict_contours_to_largest_component=True:
+        1. определяется максимальная связная область выше component_baseline;
+        2. эта область показывается отдельной границей;
+        3. остальные contour levels рисуются только внутри этой области.
 
     Parameters
     ----------
@@ -2464,20 +2836,40 @@ def plot_smoothed_hic_contours(
     sigma : float
         Ширина gaussian filter в пикселях.
     levels : list or None
-        Уровни contour. Если None, будут выбраны автоматически.
-    show_image : bool
-        Если True, подложить саму Hi-C карту.
+        Уровни contour. Если None, выбираются автоматически.
+    component_baseline : float
+        Уровень, по которому определяется область фонтана.
+        Для O/E-карт обычно baseline=1.0.
+    component_from_smoothed : bool
+        Если True, связная область ищется по Z_smooth.
+        Если False, по исходной Z.
+    component_connectivity : int
+        1 = 4-связность, 2 = 8-связность.
+    component_window_kb : float or None
+        Если задано, компонент ищется только внутри |x|, |y| <= component_window_kb.
+    component_diag_exclusion_kb : float or None
+        Если задано, при поиске компоненты исключается область около главной диагонали.
     """
 
     Z = np.asarray(aggregate_Z, dtype=float)
 
-    # заменим nan на медиану только для сглаживания
+    # ------------------------------------------------------------
+    # smoothing
+    # ------------------------------------------------------------
     Z_fill = Z.copy()
-    med = np.nanmedian(Z_fill[np.isfinite(Z_fill)])
-    Z_fill[~np.isfinite(Z_fill)] = med
+    finite = np.isfinite(Z_fill)
 
+    if np.any(finite):
+        med = np.nanmedian(Z_fill[finite])
+    else:
+        med = component_baseline
+
+    Z_fill[~finite] = med
     Z_smooth = gaussian_filter(Z_fill, sigma=sigma)
 
+    # ------------------------------------------------------------
+    # coordinate grid
+    # ------------------------------------------------------------
     n = Z.shape[0]
     bin_kb = res / 1000.0
     coords_kb = (np.arange(n) - (n - 1) / 2.0) * bin_kb
@@ -2491,11 +2883,70 @@ def plot_smoothed_hic_contours(
 
     X, Y = np.meshgrid(coords_kb, coords_kb)
 
-    if levels is None:
-        # можно менять процентили под задачу
-        vals = Z_smooth[np.isfinite(Z_smooth)]
-        levels = np.quantile(vals, [0.70, 0.80, 0.88, 0.94, 0.97])
+    # ------------------------------------------------------------
+    # largest connected component above baseline
+    # ------------------------------------------------------------
+    component_mask = np.ones_like(Z_smooth, dtype=bool)
+    largest_component_n_pixels = np.nan
+    n_components = 0
 
+    if restrict_contours_to_largest_component:
+        Z_component_field = Z_smooth if component_from_smoothed else Z
+
+        candidate_mask = (
+            np.isfinite(Z_component_field)
+            & (Z_component_field > component_baseline)
+        )
+
+        if component_window_kb is not None:
+            candidate_mask &= np.abs(X) <= component_window_kb
+            candidate_mask &= np.abs(Y) <= component_window_kb
+
+        if component_diag_exclusion_kb is not None:
+            candidate_mask &= np.abs(X - Y) >= component_diag_exclusion_kb
+
+        structure = generate_binary_structure(2, component_connectivity)
+        labeled, n_components = label(candidate_mask, structure=structure)
+
+        if n_components == 0:
+            component_mask = np.zeros_like(candidate_mask, dtype=bool)
+            largest_component_n_pixels = 0
+        else:
+            sizes = np.bincount(labeled.ravel())
+            sizes[0] = 0  # background
+
+            largest_label = int(np.argmax(sizes))
+            largest_component_n_pixels = int(sizes[largest_label])
+            component_mask = labeled == largest_label
+
+    # ------------------------------------------------------------
+    # levels
+    # ------------------------------------------------------------
+    if restrict_contours_to_largest_component:
+        vals_for_levels = Z_smooth[
+            np.isfinite(Z_smooth) & component_mask
+        ]
+    else:
+        vals_for_levels = Z_smooth[np.isfinite(Z_smooth)]
+
+    if levels is None:
+        if vals_for_levels.size > 0:
+            levels = np.quantile(
+                vals_for_levels,
+                [0.70, 0.80, 0.88, 0.94, 0.97],
+            )
+        else:
+            levels = np.array([])
+
+    levels = np.asarray(levels, dtype=float)
+    levels = levels[np.isfinite(levels)]
+
+    if restrict_contours_to_largest_component and drop_levels_below_component_baseline:
+        levels = levels[levels > component_baseline]
+
+    # ------------------------------------------------------------
+    # plotting
+    # ------------------------------------------------------------
     fig, ax = plt.subplots(figsize=figsize)
 
     if show_image:
@@ -2511,26 +2962,120 @@ def plot_smoothed_hic_contours(
         )
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-    cs = ax.contour(
-        X,
-        Y,
-        Z_smooth,
-        levels=levels,
-        colors=linecolor,
-        linewidths=linewidth,
+    # optional fill for selected component
+    if (
+        restrict_contours_to_largest_component
+        and shade_component
+        and np.any(component_mask)
+    ):
+        ax.contourf(
+            X,
+            Y,
+            component_mask.astype(float),
+            levels=[0.5, 1.5],
+            colors=[component_fill_color],
+            alpha=component_fill_alpha,
+            zorder=5,
+        )
+
+    # boundary of largest component / baseline contour
+    if (
+        restrict_contours_to_largest_component
+        and show_component_boundary
+        and np.any(component_mask)
+    ):
+        ax.contour(
+            X,
+            Y,
+            component_mask.astype(float),
+            levels=[0.5],
+            colors=component_boundary_color,
+            linewidths=component_boundary_linewidth,
+            linestyles=component_boundary_linestyle,
+            zorder=20,
+        )
+
+    # ------------------------------------------------------------
+    # contours only inside largest component
+    # ------------------------------------------------------------
+    if restrict_contours_to_largest_component:
+        Z_for_contour = np.ma.masked_where(~component_mask, Z_smooth)
+        contour_vals = Z_smooth[np.isfinite(Z_smooth) & component_mask]
+    else:
+        Z_for_contour = Z_smooth
+        contour_vals = Z_smooth[np.isfinite(Z_smooth)]
+
+    # remove levels outside actual plotted range
+    if contour_vals.size > 0 and levels.size > 0:
+        zmin = np.nanmin(contour_vals)
+        zmax = np.nanmax(contour_vals)
+        levels_use = levels[(levels > zmin) & (levels < zmax)]
+    else:
+        levels_use = np.array([])
+
+    cs = None
+
+    if levels_use.size > 0:
+        cs = ax.contour(
+            X,
+            Y,
+            Z_for_contour,
+            levels=levels_use,
+            colors=linecolor,
+            linewidths=linewidth,
+            zorder=30,
+        )
+
+        ax.clabel(cs, inline=True, fontsize=8, fmt="%.2f")
+
+    # diagonals
+    ax.axline(
+        (0, 0),
+        slope=1,
+        linestyle="--",
+        linewidth=1,
+        color="gray",
+        alpha=0.6,
+        zorder=40,
     )
-
-    ax.clabel(cs, inline=True, fontsize=8, fmt="%.2f")
-
-    ax.axline((0, 0), slope=1, linestyle="--", linewidth=1, color="gray", alpha=0.6)
-    ax.axline((0, 0), slope=-1, linestyle=":", linewidth=1, color="gray", alpha=0.6)
+    ax.axline(
+        (0, 0),
+        slope=-1,
+        linestyle=":",
+        linewidth=1,
+        color="gray",
+        alpha=0.6,
+        zorder=40,
+    )
 
     ax.set_xlabel("Distance from fountain base, kb")
     ax.set_ylabel("Distance from fountain base, kb")
-    ax.set_title(f"Smoothed contours of aggregated fountain (sigma={sigma})")
+
+    if restrict_contours_to_largest_component:
+        ax.set_title(
+            f"Smoothed contours inside largest component "
+            f"(baseline={component_baseline}, sigma={sigma})"
+        )
+    else:
+        ax.set_title(
+            f"Smoothed contours of aggregated fountain (sigma={sigma})"
+        )
 
     plt.tight_layout()
-    return fig, ax, Z_smooth, levels
+
+    component_info = {
+        "component_mask": component_mask,
+        "largest_component_n_pixels": largest_component_n_pixels,
+        "n_components": int(n_components),
+        "component_baseline": component_baseline,
+        "levels_used": levels_use,
+        "levels_requested": levels,
+    }
+
+    if return_component_info:
+        return fig, ax, Z_smooth, levels_use, component_info
+
+    return fig, ax, Z_smooth, levels_use
 
 
 def extrusion_fountain_kernel(l, r, sigma, gamma0):
@@ -4530,7 +5075,7 @@ def build_oriented_aggregate_fountain(
     expected_nproc=1,
     min_weight=0,
     require_full_window=True,
-    base_shift_bp=-6000,
+    base_shift_bp=0,
     fountain_id_col='Fountain index',
     minus_reflect=True,
     contact_prefer='nearest_ep',
@@ -5885,6 +6430,14 @@ def make_norm_mask(X_grid, Y_grid, orientation="upper", norm_window_kb=None):
 # ============================================================
 # Data preparation
 # ============================================================
+def apply_reference_normalization(F, ref_lo, ref_hi):
+    F = np.asarray(F, dtype=float)
+
+    if not np.isfinite(ref_hi - ref_lo) or ref_hi <= ref_lo:
+        raise ValueError("Invalid reference normalization range.")
+
+    return (F - ref_lo) / (ref_hi - ref_lo)
+
 
 def prepare_gaussian_contour_model(
     gaussian_fit,
@@ -5915,7 +6468,6 @@ def prepare_gaussian_contour_model(
     )
 
     return gaussian_model
-
 def prepare_aggregate_contour_data(
     aggregate_Z,
     P,
@@ -5944,27 +6496,64 @@ def prepare_aggregate_contour_data(
     # gaussian
     gaussian_fit=None,
     gaussian_fit_cache=None,
+
+    # numeric best-fit contour normalization
+    numeric_contour_norm_mode="self",       # "self" or "best_fit"
+    numeric_fit_include_offset=True,
+    numeric_fit_force_positive_scale=True,
+    numeric_fit_window_kb=None,
+    numeric_fit_center_xy_kb=None,
+
+    # common contour reference
+    contour_reference_mode="self",          # "self" or "numeric_best_fit"
+
+    # optional: useful if gaussian_model is shape-only
+    refit_gaussian_to_hic_for_contours=False,
+    gaussian_fit_include_offset=True,
 ):
     """
     Готовит все поля и координаты для отрисовки.
-    Здесь нет matplotlib-отрисовки.
 
-    Levels:
-    -------
-    common_contour_levels:
-        Общий fallback для всех типов контуров.
+    numeric_contour_norm_mode:
+        "self":
+            P нормируется само по себе.
 
-    hic_contour_levels:
-        Уровни для Hi-C contours.
+        "best_fit":
+            сначала фитим Z_smooth ≈ offset + scale * P_on_hic,
+            затем для numeric contours используем fitted numeric model:
+                P_fitted = offset + scale * P.
 
-    numeric_contour_levels:
-        Уровни для numerical model contours.
+    contour_reference_mode:
+        "self":
+            Hi-C, numeric и Gaussian нормируются каждый по своей шкале.
 
-    gaussian_contour_levels:
-        Уровни для Gaussian fit contours.
-
-    Если individual levels не заданы, используется common_contour_levels.
+        "numeric_best_fit":
+            Hi-C, numeric и Gaussian нормируются в общей шкале,
+            заданной fitted numerical model.
     """
+
+    # ------------------------------------------------------------
+    # Validate options
+    # ------------------------------------------------------------
+
+    if orientation not in ("upper", "lower", "both"):
+        raise ValueError("orientation должен быть 'upper', 'lower' или 'both'.")
+
+    if numeric_contour_norm_mode not in ("self", "best_fit"):
+        raise ValueError(
+            "numeric_contour_norm_mode должен быть 'self' или 'best_fit'."
+        )
+
+    if contour_reference_mode not in ("self", "numeric_best_fit"):
+        raise ValueError(
+            "contour_reference_mode должен быть 'self' или 'numeric_best_fit'."
+        )
+
+    if contour_reference_mode == "numeric_best_fit" and numeric_contour_norm_mode != "best_fit":
+        raise ValueError(
+            "contour_reference_mode='numeric_best_fit' требует "
+            "numeric_contour_norm_mode='best_fit'."
+        )
 
     Z = np.asarray(aggregate_Z, dtype=float)
     P = np.asarray(P, dtype=float)
@@ -5989,9 +6578,9 @@ def prepare_aggregate_contour_data(
     numeric_contour_levels = np.asarray(numeric_contour_levels, dtype=float)
     gaussian_contour_levels = np.asarray(gaussian_contour_levels, dtype=float)
 
-    # ----------------------------
+    # ------------------------------------------------------------
     # Hi-C contours
-    # ----------------------------
+    # ------------------------------------------------------------
 
     Z_smooth = smooth_array(
         Z,
@@ -6013,21 +6602,18 @@ def prepare_aggregate_contour_data(
             q_low=norm_q_low,
             q_high=norm_q_high,
         )
-        hic_levels = filter_levels_to_data(
-            Z_contour,
-            hic_contour_levels,
-        )
     else:
         Z_contour = Z_smooth
         z_lo, z_hi = np.nan, np.nan
-        hic_levels = filter_levels_to_data(
-            Z_contour,
-            hic_contour_levels,
-        )
 
-    # ----------------------------
+    hic_levels = filter_levels_to_data(
+        Z_contour,
+        hic_contour_levels,
+    )
+
+    # ------------------------------------------------------------
     # Numerical contours
-    # ----------------------------
+    # ------------------------------------------------------------
 
     P_smooth = smooth_array(
         P,
@@ -6035,24 +6621,146 @@ def prepare_aggregate_contour_data(
         fill_nan="zero",
     )
 
-    if normalize_contours:
+    numeric_fit_res = None
+    P_on_hic = None
+    P_fit_on_hic = None
+    numeric_fit_mask = None
+
+    ref_lo = np.nan
+    ref_hi = np.nan
+
+    def _numeric_on_hic_for_orientation(orient):
+        if orient == "upper":
+            X_num = RIGHT * lp_kb
+            Y_num = -LEFT * lp_kb
+        elif orient == "lower":
+            X_num = -RIGHT * lp_kb
+            Y_num = LEFT * lp_kb
+        else:
+            raise ValueError("orient должен быть 'upper' или 'lower'.")
+
+        return interpolate_numeric_to_hic_grid(
+            P_model=P_smooth,
+            X_model=X_num,
+            Y_model=Y_num,
+            X_hic=X_grid,
+            Y_hic=Y_grid,
+        )
+
+    if normalize_contours and numeric_contour_norm_mode == "best_fit":
+
+        if orientation == "upper":
+            P_on_hic = _numeric_on_hic_for_orientation("upper")
+
+        elif orientation == "lower":
+            P_on_hic = _numeric_on_hic_for_orientation("lower")
+
+        else:  # orientation == "both"
+            P_upper = _numeric_on_hic_for_orientation("upper")
+            P_lower = _numeric_on_hic_for_orientation("lower")
+
+            P_on_hic = P_upper.copy()
+            fill = ~np.isfinite(P_on_hic) & np.isfinite(P_lower)
+            P_on_hic[fill] = P_lower[fill]
+
+        fit_mask = make_norm_mask(
+            X_grid,
+            Y_grid,
+            orientation=orientation,
+            norm_window_kb=norm_window_kb,
+        )
+
+        if numeric_fit_window_kb is not None:
+            if numeric_fit_center_xy_kb is None:
+                cx, cy = 0.0, 0.0
+            else:
+                cx, cy = numeric_fit_center_xy_kb
+
+            fit_mask &= np.abs(X_grid - cx) <= numeric_fit_window_kb
+            fit_mask &= np.abs(Y_grid - cy) <= numeric_fit_window_kb
+
+        numeric_fit_mask = fit_mask
+
+        numeric_fit_res = fit_linear_scale_offset(
+            data=Z_smooth,
+            model=P_on_hic,
+            mask=fit_mask,
+            include_offset=numeric_fit_include_offset,
+            force_positive_scale=numeric_fit_force_positive_scale,
+        )
+
+        p_offset = numeric_fit_res["offset"]
+        p_scale = numeric_fit_res["scale"]
+
+        # fitted numerical model on native numerical grid
+        P_for_contour = p_offset + p_scale * P_smooth
+
+        # fitted numerical model on Hi-C grid
+        P_fit_on_hic = numeric_fit_res["fitted"]
+
+        if contour_reference_mode == "numeric_best_fit":
+            ref_vals = P_fit_on_hic[fit_mask]
+            ref_vals = ref_vals[np.isfinite(ref_vals)]
+
+            if ref_vals.size < 5:
+                raise ValueError(
+                    "Too few finite values for numeric_best_fit reference."
+                )
+
+            ref_lo = float(np.nanquantile(ref_vals, norm_q_low))
+            ref_hi = float(np.nanquantile(ref_vals, norm_q_high))
+
+            if not np.isfinite(ref_hi - ref_lo) or ref_hi <= ref_lo:
+                raise ValueError("Invalid numeric_best_fit normalization range.")
+
+            P_contour = apply_reference_normalization(
+                P_for_contour,
+                ref_lo,
+                ref_hi,
+            )
+
+            Z_contour = apply_reference_normalization(
+                Z_smooth,
+                ref_lo,
+                ref_hi,
+            )
+
+            z_lo, z_hi = ref_lo, ref_hi
+            p_lo, p_hi = ref_lo, ref_hi
+
+            hic_levels = filter_levels_to_data(
+                Z_contour,
+                hic_contour_levels,
+            )
+
+        else:
+            P_contour, p_lo, p_hi = normalize_for_contours(
+                P_for_contour,
+                mask=None,
+                q_low=norm_q_low,
+                q_high=norm_q_high,
+            )
+
+    elif normalize_contours and numeric_contour_norm_mode == "self":
         P_contour, p_lo, p_hi = normalize_for_contours(
             P_smooth,
             mask=None,
             q_low=norm_q_low,
             q_high=norm_q_high,
         )
-        numeric_levels = filter_levels_to_data(
-            P_contour,
-            numeric_contour_levels,
-        )
+
     else:
         P_contour = P_smooth
         p_lo, p_hi = np.nan, np.nan
-        numeric_levels = filter_levels_to_data(
-            P_contour,
-            numeric_contour_levels,
-        )
+
+    # ------------------------------------------------------------
+    # Numerical contour levels and contour sets
+    # ------------------------------------------------------------
+
+    numeric_levels = filter_levels_to_data(
+        P_contour,
+        numeric_contour_levels,
+    )
 
     numeric_contour_sets = []
 
@@ -6074,9 +6782,9 @@ def prepare_aggregate_contour_data(
             "name": "numeric_lower",
         })
 
-    # ----------------------------
+    # ------------------------------------------------------------
     # Gaussian contours
-    # ----------------------------
+    # ------------------------------------------------------------
 
     gaussian_model = prepare_gaussian_contour_model(
         gaussian_fit=gaussian_fit,
@@ -6086,31 +6794,66 @@ def prepare_aggregate_contour_data(
         Y_grid=Y_grid,
     )
 
+    gaussian_fit_res = None
+
     if gaussian_model is not None:
         G_smooth = gaussian_model
 
-        if normalize_contours:
+        if (
+            normalize_contours
+            and contour_reference_mode == "numeric_best_fit"
+        ):
+            if refit_gaussian_to_hic_for_contours:
+                if numeric_fit_mask is None:
+                    gaussian_mask = norm_mask
+                else:
+                    gaussian_mask = numeric_fit_mask
+
+                gaussian_fit_res = fit_linear_scale_offset(
+                    data=Z_smooth,
+                    model=G_smooth,
+                    mask=gaussian_mask,
+                    include_offset=gaussian_fit_include_offset,
+                    force_positive_scale=True,
+                )
+
+                G_for_contour = gaussian_fit_res["fitted"]
+            else:
+                G_for_contour = G_smooth
+
+            G_contour = apply_reference_normalization(
+                G_for_contour,
+                ref_lo,
+                ref_hi,
+            )
+
+            g_lo, g_hi = ref_lo, ref_hi
+
+        elif normalize_contours:
             G_contour, g_lo, g_hi = normalize_for_contours(
                 G_smooth,
                 mask=norm_mask,
                 q_low=norm_q_low,
                 q_high=norm_q_high,
             )
-            gaussian_levels = filter_levels_to_data(
-                G_contour,
-                gaussian_contour_levels,
-            )
+
         else:
             G_contour = G_smooth
             g_lo, g_hi = np.nan, np.nan
-            gaussian_levels = filter_levels_to_data(
-                G_contour,
-                gaussian_contour_levels,
-            )
+
+        gaussian_levels = filter_levels_to_data(
+            G_contour,
+            gaussian_contour_levels,
+        )
+
     else:
         G_contour = None
         gaussian_levels = np.array([])
         g_lo, g_hi = np.nan, np.nan
+
+    # ------------------------------------------------------------
+    # Return
+    # ------------------------------------------------------------
 
     return {
         "Z": Z,
@@ -6124,10 +6867,15 @@ def prepare_aggregate_contour_data(
 
         "P_smooth": P_smooth,
         "P_contour": P_contour,
+        "P_on_hic": P_on_hic,
+        "P_fit_on_hic": P_fit_on_hic,
+        "numeric_fit_res": numeric_fit_res,
+        "numeric_fit_mask": numeric_fit_mask,
         "numeric_contour_sets": numeric_contour_sets,
 
         "gaussian_model": gaussian_model,
         "G_contour": G_contour,
+        "gaussian_fit_res": gaussian_fit_res,
         "gaussian_levels": gaussian_levels,
 
         "requested_levels": {
@@ -6143,6 +6891,12 @@ def prepare_aggregate_contour_data(
             "p_hi": p_hi,
             "g_lo": g_lo,
             "g_hi": g_hi,
+            "ref_lo": ref_lo,
+            "ref_hi": ref_hi,
+            "numeric_contour_norm_mode": numeric_contour_norm_mode,
+            "numeric_fit_include_offset": numeric_fit_include_offset,
+            "contour_reference_mode": contour_reference_mode,
+            "refit_gaussian_to_hic_for_contours": refit_gaussian_to_hic_for_contours,
         },
     }
     
@@ -6202,6 +6956,15 @@ def plot_aggregate_with_numeric_contact_contours(
     figsize=(6.5, 5.8),
     output_png=None,
     dpi=300,
+    
+    # ticks
+    tick_fontsize=12,
+    x_tick_step=None,
+    y_tick_step=None,
+
+    # colorbar ticks
+    colorbar_tick_fontsize=10,
+    colorbar_tick_step=None
 ):
     """
     Только отрисовка.
@@ -6249,8 +7012,28 @@ def plot_aggregate_with_numeric_contact_contours(
     )
 
     if show_colorbar:
-        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label("Hi-C intensity", fontsize=11)
+        cbar = plt.colorbar(
+            im,
+            ax=ax,
+            fraction=0.046,
+            pad=0.04
+        )
+
+        cbar.ax.tick_params(
+            labelsize=colorbar_tick_fontsize
+        )
+
+        if colorbar_tick_step is not None:
+            from matplotlib.ticker import MultipleLocator
+
+            if cbar.orientation == "vertical":
+                cbar.ax.yaxis.set_major_locator(
+                    MultipleLocator(colorbar_tick_step)
+                )
+            else:
+                cbar.ax.xaxis.set_major_locator(
+                    MultipleLocator(colorbar_tick_step)
+                )
 
     legend_handles = []
 
@@ -6508,8 +7291,26 @@ def plot_aggregate_with_numeric_contact_contours(
             fontsize=9,
         )
 
-    ax.set_xlabel("Distance from fountain base, kb", fontsize=12)
-    ax.set_ylabel("Distance from fountain base, kb", fontsize=12)
+#    ax.set_xlabel("Distance from fountain base, kb", fontsize=12)
+#    ax.set_ylabel("Distance from fountain base, kb", fontsize=12)
+
+    # ----------------------------
+    # Axis ticks
+    # ----------------------------
+
+    ax.tick_params(
+        axis="both",
+        which="major",
+        labelsize=tick_fontsize,
+    )
+
+    if x_tick_step is not None:
+        from matplotlib.ticker import MultipleLocator
+        ax.xaxis.set_major_locator(MultipleLocator(x_tick_step))
+
+    if y_tick_step is not None:
+        from matplotlib.ticker import MultipleLocator
+        ax.yaxis.set_major_locator(MultipleLocator(y_tick_step))
 
     plt.tight_layout()
 
@@ -6935,7 +7736,7 @@ def compute_model_P_hic_for_params(
     xmax = flank_kb / lp_kb
     Lmax = 2.2 * xmax
 
-    kernel_res = ft.build_numeric_fountain_kernel(
+    kernel_res = build_numeric_fountain_kernel(
         Lmax=Lmax,
         N=N,
 
@@ -6954,7 +7755,7 @@ def compute_model_P_hic_for_params(
 
     A_kernel = kernel_res["Nfin"]
 
-    P, LEFT, RIGHT, A_interp = ft.contact_map_from_kernel_array(
+    P, LEFT, RIGHT, A_interp = contact_map_from_kernel_array(
         l_grid=kernel_res["l_grid"],
         r_grid=kernel_res["r_grid"],
         A_kernel=A_kernel,
@@ -7543,7 +8344,7 @@ def fit_gamma_c_rho_sigma_fast(
             return 1e6
 
         try:
-            kernel_res = ft.build_numeric_fountain_kernel(
+            kernel_res = build_numeric_fountain_kernel(
                 Lmax=Lmax,
                 N=N,
                 alpha=alpha,
@@ -7970,7 +8771,7 @@ def fit_gamma_c_rho_sigma_progressive_grid(
         for gamma_c in gamma_grid:
 
             try:
-                kernel_res = ft.build_numeric_fountain_kernel(
+                kernel_res = build_numeric_fountain_kernel(
                     Lmax=Lmax,
                     N=N,
                     alpha=alpha,
@@ -8239,7 +9040,7 @@ def compute_rmse_for_numeric_fit_params(
     xmax = flank_kb / lp_kb
     Lmax = 2.2 * xmax
 
-    kernel_res = ft.build_numeric_fountain_kernel(
+    kernel_res = build_numeric_fountain_kernel(
         Lmax=Lmax,
         N=N,
         alpha=alpha,
@@ -8255,7 +9056,7 @@ def compute_rmse_for_numeric_fit_params(
         kernel="Nfin",
     )
 
-    P, LEFT, RIGHT, A_interp = ft.contact_map_from_kernel_array(
+    P, LEFT, RIGHT, A_interp = contact_map_from_kernel_array(
         l_grid=kernel_res["l_grid"],
         r_grid=kernel_res["r_grid"],
         A_kernel=kernel_res["Nfin"],
@@ -8270,7 +9071,7 @@ def compute_rmse_for_numeric_fit_params(
         normalize=True,
     )
 
-    plot_data = ft.prepare_aggregate_contour_data(
+    plot_data = prepare_aggregate_contour_data(
         aggregate_Z=aggregate_Z,
         P=P,
         LEFT=LEFT,
@@ -8290,7 +9091,7 @@ def compute_rmse_for_numeric_fit_params(
         gaussian_fit_cache=None,
     )
 
-    rmse_res = ft.compute_norm_rmse_from_plot_data(
+    rmse_res = compute_norm_rmse_from_plot_data(
         plot_data,
         orientation=orientation,
         center_xy_kb=center_xy_kb,
@@ -9564,3 +10365,5376 @@ def fit_numeric_fountain_coordinate_descent(
     )
 
     return result
+    
+
+def nan_weighted_mean_stack(Z_stack, weights=None):
+    """
+    Усредняет стек фонтанов с учетом NaN.
+
+    Z_stack : array, shape (n_fountains, n, n)
+    weights : None or array, shape (n_fountains,)
+    """
+    Z_stack = np.asarray(Z_stack, dtype=float)
+
+    if weights is None:
+        weights = np.ones(Z_stack.shape[0], dtype=float)
+    else:
+        weights = np.asarray(weights, dtype=float)
+
+    W = weights[:, None, None]
+    valid = np.isfinite(Z_stack)
+
+    numerator = np.nansum(np.where(valid, Z_stack * W, 0.0), axis=0)
+    denominator = np.sum(np.where(valid, W, 0.0), axis=0)
+
+    out = np.full(Z_stack.shape[1:], np.nan, dtype=float)
+    ok = denominator > 0
+    out[ok] = numerator[ok] / denominator[ok]
+
+    return out
+
+
+def gaussian_prediction_from_fit(fit, fit_cache, n):
+    """
+    Строит fitted Gaussian grid для результата fit_one_fountain_matrix /
+    fit_aggregate_fountain.
+    """
+    ctx = fit_cache.get(n)
+    X = ctx["X"]
+    Y = ctx["Y"]
+
+    theta = np.array(
+        [
+            float(fit["a_kb"]),
+            float(fit["b_kb"]),
+            float(fit["p_kb"]),
+            float(fit["A"]),
+            float(fit["C"]),
+        ],
+        dtype=float,
+    )
+
+    return gaussian_fountain_model(theta, X, Y)
+
+
+def make_gaussian_fit_masks(
+    Z,
+    fit,
+    fit_cache,
+    full_mode="finite_upper",
+    peak_radius_kb=60,
+):
+    """
+    Маски для оценки NRMSE.
+
+    full_mode:
+        "finite_upper" — все finite-пиксели верхнего треугольника
+        "fit_cache_base" — base_mask из fit_cache, то есть область около фонтана
+
+    peak_radius_kb:
+        радиус области вокруг fitted peak в повернутых координатах.
+        Пик модели находится в координатах x=p, y=-p.
+    """
+    Z = np.asarray(Z, dtype=float)
+    n = Z.shape[0]
+    ctx = fit_cache.get(n)
+
+    X = ctx["X"]
+    Y = ctx["Y"]
+
+    finite = np.isfinite(Z)
+
+    if full_mode == "finite_upper":
+        full_mask = finite & (Y < X - fit_cache.diag_exclusion_kb)
+
+    elif full_mode == "fit_cache_base":
+        full_mask = finite & ctx["base_mask"]
+
+    else:
+        raise ValueError("full_mode должен быть 'finite_upper' или 'fit_cache_base'.")
+
+    p = float(fit["p_kb"])
+
+    # Координаты относительно fitted peak.
+    # Для модели:
+    #   u = x + y
+    #   v = x - y - 2p
+    # Ортонормированный вариант:
+    U = (X + Y) / np.sqrt(2.0)
+    V = (X - Y - 2.0 * p) / np.sqrt(2.0)
+
+    peak_mask = full_mask & (U**2 + V**2 <= peak_radius_kb**2)
+
+    return full_mask, peak_mask
+
+def gaussian_prediction_from_fit_full_grid(fit, fit_cache, n, mirror=False):
+    """
+    Строит Gaussian prediction на всей сетке aggregate_Z.
+
+    mirror=False:
+        только fitted upper-fountain Gaussian.
+
+    mirror=True:
+        симметризованная модель: background + max(upper excess, lower excess).
+        Полезно, если full map содержит оба симметричных фонтана.
+    """
+    ctx = fit_cache.get(n)
+    X = ctx["X"]
+    Y = ctx["Y"]
+
+    theta = np.array(
+        [
+            float(fit["a_kb"]),
+            float(fit["b_kb"]),
+            float(fit["p_kb"]),
+            float(fit["A"]),
+            float(fit["C"]),
+        ],
+        dtype=float,
+    )
+
+    G = gaussian_fountain_model(theta, X, Y)
+
+    if mirror:
+        C = float(fit["C"])
+        G = C + np.maximum(G - C, G.T - C)
+
+    return G
+
+
+def calculate_full_map_nrmse(
+    observed,
+    predicted,
+    normalization="range",
+    q_low=0.05,
+    q_high=0.995,
+    exclude_diagonal=False,
+):
+    """
+    Чистый NRMSE по всей карте:
+        residual = predicted - observed
+
+    Никакие fit weights, downweighting, robust loss или peak penalty
+    здесь не используются.
+    """
+    observed = np.asarray(observed, dtype=float)
+    predicted = np.asarray(predicted, dtype=float)
+
+    mask = np.isfinite(observed) & np.isfinite(predicted)
+
+    if exclude_diagonal:
+        diag_mask = np.eye(observed.shape[0], dtype=bool)
+        mask &= ~diag_mask
+
+    obs = observed[mask]
+    pred = predicted[mask]
+
+    if len(obs) == 0:
+        return {
+            "nrmse": np.nan,
+            "rmse": np.nan,
+            "mae": np.nan,
+            "denominator": np.nan,
+            "n_pixels": 0,
+        }
+
+    resid = pred - obs
+
+    rmse = float(np.sqrt(np.mean(resid**2)))
+    mae = float(np.mean(np.abs(resid)))
+
+    if normalization == "range":
+        denominator = float(np.nanmax(obs) - np.nanmin(obs))
+
+    elif normalization == "robust_range":
+        lo, hi = np.nanquantile(obs, [q_low, q_high])
+        denominator = float(hi - lo)
+
+    elif normalization == "std":
+        denominator = float(np.nanstd(obs))
+
+    elif normalization == "mean_abs":
+        denominator = float(np.nanmean(np.abs(obs)))
+
+    else:
+        raise ValueError(
+            "normalization должен быть 'range', 'robust_range', 'std' или 'mean_abs'."
+        )
+
+    if not np.isfinite(denominator) or denominator <= 0:
+        nrmse = np.nan
+    else:
+        nrmse = float(rmse / denominator)
+
+    return {
+        "nrmse": nrmse,
+        "rmse": rmse,
+        "mae": mae,
+        "denominator": denominator,
+        "n_pixels": int(len(obs)),
+    }
+
+def calculate_nrmse(
+    observed,
+    predicted,
+    mask,
+    normalization="range",
+):
+    """
+    NRMSE на заданной маске.
+
+    normalization:
+        "range" — RMSE / (max(observed)-min(observed))
+        "mean"  — RMSE / mean(abs(observed))
+        "std"   — RMSE / std(observed)
+    """
+    obs = np.asarray(observed, dtype=float)[mask]
+    pred = np.asarray(predicted, dtype=float)[mask]
+
+    valid = np.isfinite(obs) & np.isfinite(pred)
+    obs = obs[valid]
+    pred = pred[valid]
+
+    if len(obs) == 0:
+        return np.nan, np.nan, 0
+
+    rmse = np.sqrt(np.mean((obs - pred) ** 2))
+
+    if normalization == "range":
+        denom = np.nanmax(obs) - np.nanmin(obs)
+    elif normalization == "mean":
+        denom = np.nanmean(np.abs(obs))
+    elif normalization == "std":
+        denom = np.nanstd(obs)
+    else:
+        raise ValueError("normalization должен быть 'range', 'mean' или 'std'.")
+
+    if not np.isfinite(denom) or denom <= 0:
+        nrmse = np.nan
+    else:
+        nrmse = rmse / denom
+
+    return float(nrmse), float(rmse), int(len(obs))
+
+
+def fit_bootstrap_aggregate_once(
+    Z_sample,
+    weights=None,
+    res=10_000,
+    p0_kb=50,
+    p_half_window_kb=40,
+    fit_window_kb=180,
+    diag_exclusion_kb=10,
+    positive_weight=True,
+    positive_weight_strength=0.75,
+    robust=True,
+    min_points=20,
+    two_step_peak_refit=True,
+    near_peak_radius_kb=90,
+    downweight_major_tail=True,
+    major_tail_side="positive",
+    major_tail_start_kb=20,
+    major_tail_transition_kb=40,
+    major_tail_min_scale=0.50,
+    nrmse_full_mode="finite_all",
+    nrmse_normalization="range",
+):
+    """
+    Один bootstrap-шаг:
+    1. агрегирует выбранные фонтаны;
+    2. фитит агрегат гауссианом;
+    3. считает:
+        - NRMSE по всей карте,
+        - NRMSE в окрестности пика +-60 kb,
+        - NRMSE в окрестности пика +-30 kb.
+
+    Важно:
+    NRMSE здесь считается чисто по observed - predicted,
+    без fit_weights, robust loss и downweighting.
+    """
+
+    aggregate_Z = nan_weighted_mean_stack(
+        Z_sample,
+        weights=weights,
+    )
+
+    fit, fit_cache = fit_aggregate_fountain_old(
+        aggregate_Z,
+        res=res,
+        p0_kb=p0_kb,
+        p_half_window_kb=p_half_window_kb,
+        fit_window_kb=fit_window_kb,
+        diag_exclusion_kb=diag_exclusion_kb,
+        positive_weight=positive_weight,
+        positive_weight_strength=positive_weight_strength,
+        robust=robust,
+        min_points=min_points,
+        two_step_peak_refit=two_step_peak_refit,
+        near_peak_radius_kb=near_peak_radius_kb,
+        downweight_major_tail=downweight_major_tail,
+        major_tail_side=major_tail_side,
+        major_tail_start_kb=major_tail_start_kb,
+        major_tail_transition_kb=major_tail_transition_kb,
+        major_tail_min_scale=major_tail_min_scale,
+    )
+
+    pred = gaussian_prediction_from_fit(
+        fit=fit,
+        fit_cache=fit_cache,
+        n=aggregate_Z.shape[0],
+    )
+
+    # ----------------------------
+    # 1. Full-map NRMSE
+    # ----------------------------
+
+    full_mask, peak_mask_60 = make_gaussian_fit_masks(
+        Z=aggregate_Z,
+        fit=fit,
+        fit_cache=fit_cache,
+        full_mode=nrmse_full_mode,
+        peak_radius_kb=60,
+    )
+
+    # ----------------------------
+    # 2. Peak +-30 kb mask
+    # ----------------------------
+
+    _, peak_mask_30 = make_gaussian_fit_masks(
+        Z=aggregate_Z,
+        fit=fit,
+        fit_cache=fit_cache,
+        full_mode=nrmse_full_mode,
+        peak_radius_kb=30,
+    )
+
+    nrmse_full, rmse_full, n_full = calculate_nrmse(
+        aggregate_Z,
+        pred,
+        full_mask,
+        normalization=nrmse_normalization,
+    )
+
+    nrmse_peak_60, rmse_peak_60, n_peak_60 = calculate_nrmse(
+        aggregate_Z,
+        pred,
+        peak_mask_60,
+        normalization=nrmse_normalization,
+    )
+
+    nrmse_peak_30, rmse_peak_30, n_peak_30 = calculate_nrmse(
+        aggregate_Z,
+        pred,
+        peak_mask_30,
+        normalization=nrmse_normalization,
+    )
+
+    row = {
+        "r": float(fit["r"]),
+        "r_gaussian": float(fit["r_gaussian"]),
+
+        "a_kb": float(fit["a_kb"]),
+        "b_kb": float(fit["b_kb"]),
+        "p_kb": float(fit["p_kb"]),
+        "A": float(fit["A"]),
+        "C": float(fit["C"]),
+
+        # 1. Чистый NRMSE по всей карте
+        "nrmse_full_map": nrmse_full,
+        "rmse_full_map": rmse_full,
+        "n_pixels_full_map": n_full,
+
+        # 2. Чистый NRMSE +-60 kb от fitted peak
+        "nrmse_peak_pm60kb": nrmse_peak_60,
+        "rmse_peak_pm60kb": rmse_peak_60,
+        "n_pixels_peak_pm60kb": n_peak_60,
+
+        # 3. Чистый NRMSE +-30 kb от fitted peak
+        "nrmse_peak_pm30kb": nrmse_peak_30,
+        "rmse_peak_pm30kb": rmse_peak_30,
+        "n_pixels_peak_pm30kb": n_peak_30,
+
+        # Диагностика самого фита
+        "fit_cost": float(fit["cost"]),
+        "fit_optimality": float(fit["optimality"]),
+    }
+
+    return row, aggregate_Z, pred, fit, fit_cache
+
+def bootstrap_fountains_gaussian_fit(
+    Z_list,
+    weights=None,
+    n_boot=500,
+    random_state=1,
+    return_matrices=False,
+    **fit_kwargs,
+):
+    """
+    Bootstrap по фонтанам.
+
+    Parameters
+    ----------
+    Z_list : list of 2D arrays or array, shape (n_fountains, n, n)
+        Индивидуальные матрицы фонтанов.
+
+    weights : None or array
+        Веса фонтанов. Если None, все веса равны 1.
+
+    n_boot : int
+        Число bootstrap-итераций.
+
+    return_matrices : bool
+        Если True, дополнительно сохраняет bootstrap-агрегаты и fitted predictions.
+        Обычно лучше False, чтобы не занимать память.
+
+    **fit_kwargs
+        Аргументы для fit_bootstrap_aggregate_once.
+    """
+    Z_stack = np.asarray(Z_list, dtype=float)
+
+    if Z_stack.ndim != 3:
+        raise ValueError(
+            "Z_list должен быть списком 2D-матриц или массивом формы "
+            "(n_fountains, n, n)."
+        )
+
+    n_fountains = Z_stack.shape[0]
+
+    if weights is None:
+        weights_all = np.ones(n_fountains, dtype=float)
+    else:
+        weights_all = np.asarray(weights, dtype=float)
+        if len(weights_all) != n_fountains:
+            raise ValueError("weights должен иметь длину n_fountains.")
+
+    rng = np.random.default_rng(random_state)
+
+    rows = []
+    aggregates = []
+    predictions = []
+
+    for b in tqdm(range(n_boot), desc="Bootstrap Gaussian fits"):
+        sample_idx = rng.integers(0, n_fountains, size=n_fountains)
+
+        Z_sample = Z_stack[sample_idx]
+        w_sample = weights_all[sample_idx]
+
+        try:
+            row, aggregate_Z, pred, fit, fit_cache = fit_bootstrap_aggregate_once(
+                Z_sample=Z_sample,
+                weights=w_sample,
+                **fit_kwargs,
+            )
+
+            row["bootstrap_id"] = b
+            row["n_sampled_fountains"] = n_fountains
+            row["n_unique_fountains"] = int(len(np.unique(sample_idx)))
+            row["status"] = "ok"
+
+            rows.append(row)
+
+            if return_matrices:
+                aggregates.append(aggregate_Z)
+                predictions.append(pred)
+
+        except Exception as e:
+            rows.append(
+                {
+                    "bootstrap_id": b,
+                    "n_sampled_fountains": n_fountains,
+                    "n_unique_fountains": int(len(np.unique(sample_idx))),
+                    "status": "failed",
+                    "error": repr(e),
+                }
+            )
+
+    boot_df = pd.DataFrame(rows)
+
+    ok = boot_df["status"] == "ok"
+    ok_df = boot_df.loc[ok].copy()
+
+    summary = {
+        "n_boot_requested": int(n_boot),
+        "n_boot_success": int(ok.sum()),
+        "n_boot_failed": int((~ok).sum()),
+    }
+
+    metrics = [
+        "r",
+        "a_kb",
+        "b_kb",
+        "p_kb",
+
+        "nrmse_full_map",
+        "nrmse_peak_pm60kb",
+        "nrmse_peak_pm30kb",
+
+        "rmse_full_map",
+        "rmse_peak_pm60kb",
+        "rmse_peak_pm30kb",
+    ]
+
+    for col in metrics:
+        if col in ok_df.columns and len(ok_df) > 0:
+            vals = ok_df[col].to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+
+            if len(vals) > 0:
+                summary[f"{col}_mean"] = float(np.mean(vals))
+                summary[f"{col}_std"] = float(np.std(vals, ddof=1)) if len(vals) > 1 else np.nan
+                summary[f"{col}_median"] = float(np.median(vals))
+                summary[f"{col}_ci95_low"] = float(np.quantile(vals, 0.025))
+                summary[f"{col}_ci95_high"] = float(np.quantile(vals, 0.975))
+            else:
+                summary[f"{col}_mean"] = np.nan
+                summary[f"{col}_std"] = np.nan
+                summary[f"{col}_median"] = np.nan
+                summary[f"{col}_ci95_low"] = np.nan
+                summary[f"{col}_ci95_high"] = np.nan
+
+    result = {
+        "boot_df": boot_df,
+        "summary": summary,
+    }
+
+    if return_matrices:
+        result["aggregates"] = aggregates
+        result["predictions"] = predictions
+
+    return result
+    
+def collect_individual_fountain_Zs(
+    cool_path,
+    fountains_csv,
+    res=10_000,
+    flank=300_000,
+    z_transform="oe",
+    expected_nproc=1,
+    weight_col="Fountain Score",
+    min_weight=None,
+    require_full_window=True,
+    base_shift_bp=0,
+    max_fountains=None,
+):
+    """
+    Достаёт индивидуальные матрицы фонтанов для bootstrap.
+
+    Returns
+    -------
+    individual_Z_list : list[np.ndarray]
+        Список индивидуальных fountain matrices.
+
+    Z_stack : np.ndarray
+        Массив формы (n_fountains, n, n), удобный для bootstrap.
+
+    used_df : pd.DataFrame
+        Метаданные успешно извлечённых фонтанов.
+
+    failed_df : pd.DataFrame
+        Фонтаны, которые не удалось извлечь.
+
+    expected_raw : pd.DataFrame
+        Таблица expected_cis.
+
+    exp_cache : ExpectedMatrixCache
+        Кэш expected matrices, если потом понадобится.
+    """
+
+    clr = cooler.Cooler(f"{cool_path}::resolutions/{res}")
+
+    fountains = load_fountains_csv(fountains_csv)
+    fountains = harmonize_fountain_chroms_to_cooler(fountains, clr)
+
+    if "base_bp" not in fountains.columns:
+        fountains["base_bp"] = (
+            fountains["start"].astype(int)
+            + fountains["end"].astype(int)
+        ) // 2
+
+    if max_fountains is not None:
+        fountains = fountains.iloc[:max_fountains].copy()
+
+    chroms = sorted(fountains["chrom"].unique())
+
+    expected_by_chrom, expected_raw, exp_col = compute_expected_by_chrom(
+        clr,
+        chroms=chroms,
+        smooth=False,
+        aggregate_smoothed=False,
+        nproc=expected_nproc,
+        chunksize=1_000_000,
+    )
+
+    exp_cache = ExpectedMatrixCache(expected_by_chrom)
+    matrix_selector = clr.matrix(balance=True)
+
+    expected_n = int(2 * flank / res) + 1
+
+    individual_Z_list = []
+    used_rows = []
+    failed_rows = []
+
+    for _, row in tqdm(
+        fountains.iterrows(),
+        total=len(fountains),
+        desc="Extracting individual fountains",
+    ):
+        fountain_index = row["Fountain index"]
+
+        try:
+            weight = 1.0
+
+            if weight_col is not None and weight_col in row:
+                weight = float(row[weight_col])
+
+            if not np.isfinite(weight):
+                raise ValueError(f"Non-finite weight: {weight}")
+
+            if min_weight is not None and weight <= min_weight:
+                raise ValueError(f"Weight <= min_weight: {weight}")
+
+            Z, meta = extract_fountain_Z(
+                row=row,
+                clr=clr,
+                matrix_selector=matrix_selector,
+                exp_cache=exp_cache,
+                flank=flank,
+                res=res,
+                z_transform=z_transform,
+                require_full_window=require_full_window,
+                base_shift_bp=base_shift_bp,
+            )
+
+            if require_full_window and Z.shape != (expected_n, expected_n):
+                raise ValueError(
+                    f"Unexpected Z shape: {Z.shape}, "
+                    f"expected {(expected_n, expected_n)}"
+                )
+
+            if np.count_nonzero(np.isfinite(Z)) == 0:
+                raise ValueError("No finite pixels in Z")
+
+            individual_Z_list.append(Z)
+
+            used_rows.append(
+                {
+                    "Fountain index": fountain_index,
+                    "chrom": row["chrom"],
+                    "chrom_original": row.get("chrom_original", row["chrom"]),
+                    "start": int(row["start"]),
+                    "end": int(row["end"]),
+                    "base_bp_original": int(row["base_bp"]),
+                    "base_bp_used": int(meta["base_bp"]),
+                    "region": meta["region"],
+                    "region_start": int(meta["region_start"]),
+                    "region_end": int(meta["region_end"]),
+                    "n": int(meta["n"]),
+                    "weight": float(weight),
+                    "Fountain Score": row.get("Fountain Score", np.nan),
+                    "expected_column": exp_col,
+                    "z_transform": z_transform,
+                    "base_shift_bp": int(base_shift_bp),
+                }
+            )
+
+        except Exception as e:
+            failed_rows.append(
+                {
+                    "Fountain index": fountain_index,
+                    "chrom": row.get("chrom", np.nan),
+                    "start": row.get("start", np.nan),
+                    "end": row.get("end", np.nan),
+                    "base_bp": row.get("base_bp", np.nan),
+                    "Fountain Score": row.get("Fountain Score", np.nan),
+                    "error": repr(e),
+                }
+            )
+
+    if len(individual_Z_list) == 0:
+        failed_df = pd.DataFrame(failed_rows)
+
+        print("No individual fountains extracted.")
+        print("Top errors:")
+        print(failed_df["error"].value_counts().head(20))
+
+        return [], None, pd.DataFrame(), failed_df, expected_raw, exp_cache
+        raise RuntimeError("Не удалось извлечь ни одного индивидуального фонтана.")
+
+    shapes = [Z.shape for Z in individual_Z_list]
+    unique_shapes = sorted(set(shapes))
+
+    if len(unique_shapes) != 1:
+        raise ValueError(
+            "Не все индивидуальные матрицы имеют одинаковую форму. "
+            f"Найденные формы: {unique_shapes}. "
+            "Попробуй require_full_window=True или проверь края хромосом."
+        )
+
+    Z_stack = np.stack(individual_Z_list, axis=0)
+
+    used_df = pd.DataFrame(used_rows)
+    failed_df = pd.DataFrame(failed_rows)
+
+    return individual_Z_list, Z_stack, used_df, failed_df, expected_raw, exp_cache
+    
+def make_gaussian_fit_masks(
+    Z,
+    fit,
+    fit_cache,
+    full_mode="finite_all",
+    peak_radius_kb=60,
+):
+    """
+    Маски для оценки NRMSE.
+
+    full_mode:
+        "finite_all"      — вся finite-карта
+        "finite_upper"    — finite-пиксели верхнего треугольника
+        "fit_cache_base"  — только base_mask из fit_cache, то есть область фита
+
+    peak_radius_kb:
+        радиус области вокруг fitted peak в повернутых координатах U, V.
+    """
+
+    Z = np.asarray(Z, dtype=float)
+    n = Z.shape[0]
+
+    ctx = fit_cache.get(n)
+    X = ctx["X"]
+    Y = ctx["Y"]
+
+    finite = np.isfinite(Z)
+
+    if full_mode == "finite_all":
+        full_mask = finite
+
+    elif full_mode == "finite_upper":
+        full_mask = finite & (Y < X - fit_cache.diag_exclusion_kb)
+
+    elif full_mode == "fit_cache_base":
+        full_mask = finite & ctx["base_mask"]
+
+    else:
+        raise ValueError(
+            "full_mode должен быть 'finite_all', 'finite_upper' или 'fit_cache_base'."
+        )
+
+    p = float(fit["p_kb"])
+
+    # Координаты относительно fitted peak:
+    # u = x + y
+    # v = x - y - 2p
+    # в ортонормированном виде:
+    U = (X + Y) / np.sqrt(2.0)
+    V = (X - Y - 2.0 * p) / np.sqrt(2.0)
+
+    peak_mask = finite & (U**2 + V**2 <= peak_radius_kb**2)
+
+    return full_mask, peak_mask
+    
+def _safe_float(x, default=np.nan):
+    try:
+        x = float(x)
+        return x if np.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def _mean_std(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+
+    if len(values) == 0:
+        return np.nan, np.nan
+
+    mean = float(np.mean(values))
+    std = float(np.std(values, ddof=1)) if len(values) > 1 else np.nan
+    return mean, std
+
+
+def _parse_score_column(s):
+    return pd.to_numeric(
+        s.astype(str).str.replace(",", ".", regex=False),
+        errors="coerce",
+    )
+
+
+def select_fountain_subset(
+    Z_stack,
+    used_df=None,
+    top_n=None,
+    score_col="Fountain Score",
+    weights=None,
+    descending=True,
+):
+    """
+    Выбирает подмножество фонтанов.
+
+    Если top_n is None:
+        берём все фонтаны.
+
+    Если top_n задан:
+        берём top_n фонтанов по score_col.
+    """
+
+    Z_stack = np.asarray(Z_stack, dtype=float)
+
+    if Z_stack.ndim != 3:
+        raise ValueError(
+            "Z_stack должен иметь форму (n_fountains, n, n)."
+        )
+
+    n_fountains = Z_stack.shape[0]
+    idx = np.arange(n_fountains)
+
+    if top_n is not None:
+        if used_df is None:
+            raise ValueError("Для top_n нужен used_df со score_col.")
+
+        if score_col not in used_df.columns:
+            raise ValueError(
+                f"В used_df нет колонки {score_col!r}. "
+                f"Доступные колонки: {list(used_df.columns)}"
+            )
+
+        scores = _parse_score_column(used_df[score_col])
+        score_values = scores.to_numpy(dtype=float)
+
+        valid = np.isfinite(score_values)
+
+        if not np.any(valid):
+            raise ValueError(f"В {score_col!r} нет finite значений.")
+
+        valid_idx = np.flatnonzero(valid)
+        order = np.argsort(score_values[valid_idx])
+
+        if descending:
+            order = order[::-1]
+
+        idx = valid_idx[order[:top_n]]
+
+    Z_sub = Z_stack[idx]
+
+    if used_df is not None:
+        used_sub = used_df.iloc[idx].copy()
+    else:
+        used_sub = None
+
+    if weights is not None:
+        w_sub = np.asarray(weights, dtype=float)[idx]
+
+    elif used_sub is not None and "weight" in used_sub.columns:
+        w_sub = pd.to_numeric(
+            used_sub["weight"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+
+    else:
+        w_sub = None
+
+    return Z_sub, used_sub, w_sub, idx
+
+
+def gaussian_prediction_from_fit_maybe_mirror(
+    fit,
+    fit_cache,
+    n,
+    mirror=False,
+):
+    """
+    Gaussian prediction на всей сетке.
+
+    mirror=False:
+        только fitted upper Gaussian.
+
+    mirror=True:
+        симметричная карта:
+            C + max(G - C, G.T - C)
+    """
+
+    G = gaussian_prediction_from_fit(
+        fit=fit,
+        fit_cache=fit_cache,
+        n=n,
+    )
+
+    if not mirror:
+        return G
+
+    C = float(fit["C"])
+    return C + np.maximum(G - C, G.T - C)
+
+
+def fit_matrix_same_settings(
+    Z,
+    fit_kwargs,
+    compute_nrmse=True,
+    nrmse_normalization="range",
+    nrmse_full_mode="finite_all",
+    peak_radius_kb=60,
+    full_nrmse_mirror=False,
+):
+    """
+    Один общий fit-wrapper.
+
+    Все методы — individual, bootstrap, aggregate —
+    должны вызывать именно эту функцию.
+    """
+
+    Z = np.asarray(Z, dtype=float)
+
+    fit, fit_cache = fit_aggregate_fountain_old(
+        Z,
+        **fit_kwargs,
+    )
+
+    row = {
+        "r": _safe_float(fit.get("r")),
+        "r_gaussian": _safe_float(fit.get("r_gaussian")),
+        "r_old_linear": _safe_float(fit.get("r_old_linear")),
+
+        "r_se": _safe_float(fit.get("r_se")),
+        "r_ci95_low": _safe_float(fit.get("r_ci95_low")),
+        "r_ci95_high": _safe_float(fit.get("r_ci95_high")),
+
+        "a_kb": _safe_float(fit.get("a_kb")),
+        "b_kb": _safe_float(fit.get("b_kb")),
+        "p_kb": _safe_float(fit.get("p_kb")),
+
+        "a_se_kb": _safe_float(fit.get("a_se_kb")),
+        "b_se_kb": _safe_float(fit.get("b_se_kb")),
+        "p_se_kb": _safe_float(fit.get("p_se_kb")),
+
+        "A": _safe_float(fit.get("A")),
+        "C": _safe_float(fit.get("C")),
+
+        "fit_cost": _safe_float(fit.get("cost")),
+        "fit_optimality": _safe_float(fit.get("optimality")),
+        "n_fit_pixels": int(fit.get("n_fit_pixels", 0)),
+        "fit_mode": fit.get("fit_mode", None),
+    }
+
+    pred_upper = gaussian_prediction_from_fit_maybe_mirror(
+        fit=fit,
+        fit_cache=fit_cache,
+        n=Z.shape[0],
+        mirror=False,
+    )
+
+    pred_full = gaussian_prediction_from_fit_maybe_mirror(
+        fit=fit,
+        fit_cache=fit_cache,
+        n=Z.shape[0],
+        mirror=full_nrmse_mirror,
+    )
+
+    if compute_nrmse:
+        full_mask, peak_mask = make_gaussian_fit_masks(
+            Z=Z,
+            fit=fit,
+            fit_cache=fit_cache,
+            full_mode=nrmse_full_mode,
+            peak_radius_kb=peak_radius_kb,
+        )
+
+        nrmse_full, rmse_full, n_full = calculate_nrmse(
+            Z,
+            pred_full,
+            full_mask,
+            normalization=nrmse_normalization,
+        )
+
+        nrmse_peak, rmse_peak, n_peak = calculate_nrmse(
+            Z,
+            pred_upper,
+            peak_mask,
+            normalization=nrmse_normalization,
+        )
+
+        row.update(
+            {
+                "nrmse_full_map": nrmse_full,
+                "rmse_full_map": rmse_full,
+                "n_pixels_full_map": n_full,
+
+                f"nrmse_peak_pm{int(peak_radius_kb)}kb": nrmse_peak,
+                f"rmse_peak_pm{int(peak_radius_kb)}kb": rmse_peak,
+                f"n_pixels_peak_pm{int(peak_radius_kb)}kb": n_peak,
+
+                "nrmse_normalization": nrmse_normalization,
+                "nrmse_full_mode": nrmse_full_mode,
+                "full_nrmse_mirror": bool(full_nrmse_mirror),
+            }
+        )
+
+    return row, fit, fit_cache, pred_upper, pred_full
+
+
+def fit_individual_fountains_same_settings(
+    Z_stack,
+    fit_kwargs,
+    compute_nrmse=False,
+    nrmse_normalization="range",
+    peak_radius_kb=60,
+    full_nrmse_mirror=False,
+):
+    """
+    Метод 1:
+    фит каждого индивидуального фонтана.
+
+    По умолчанию NRMSE здесь не считаем,
+    потому что ты хотела NRMSE только для bootstrap и aggregate.
+    """
+
+    Z_stack = np.asarray(Z_stack, dtype=float)
+
+    rows = []
+
+    for i in tqdm(range(Z_stack.shape[0]), desc="Fitting individual fountains"):
+        try:
+            row, fit, fit_cache, pred_upper, pred_full = fit_matrix_same_settings(
+                Z_stack[i],
+                fit_kwargs=fit_kwargs,
+                compute_nrmse=compute_nrmse,
+                nrmse_normalization=nrmse_normalization,
+                peak_radius_kb=peak_radius_kb,
+                full_nrmse_mirror=full_nrmse_mirror,
+            )
+
+            row["fountain_i"] = i
+            row["status"] = "ok"
+            rows.append(row)
+
+        except Exception as e:
+            rows.append(
+                {
+                    "fountain_i": i,
+                    "status": "failed",
+                    "error": repr(e),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def bootstrap_fountains_same_settings(
+    Z_stack,
+    fit_kwargs,
+    weights=None,
+    n_boot=500,
+    random_state=1,
+    nrmse_normalization="range",
+    peak_radius_kb=60,
+    full_nrmse_mirror=False,
+    return_matrices=False,
+):
+    """
+    Метод 2:
+    bootstrap по фонтанам.
+
+    На каждой итерации:
+        1. sample fountains with replacement;
+        2. aggregate sampled fountains;
+        3. fit aggregate with exactly the same fit_kwargs;
+        4. compute NRMSE full map and NRMSE +-peak_radius_kb.
+    """
+
+    Z_stack = np.asarray(Z_stack, dtype=float)
+
+    if Z_stack.ndim != 3:
+        raise ValueError("Z_stack должен иметь форму (n_fountains, n, n).")
+
+    n_fountains = Z_stack.shape[0]
+
+    if weights is None:
+        weights_all = np.ones(n_fountains, dtype=float)
+    else:
+        weights_all = np.asarray(weights, dtype=float)
+
+        if len(weights_all) != n_fountains:
+            raise ValueError("weights должен иметь длину n_fountains.")
+
+    rng = np.random.default_rng(random_state)
+
+    rows = []
+    aggregates = []
+    predictions = []
+
+    for b in tqdm(range(n_boot), desc="Bootstrap same-settings fits"):
+        sample_idx = rng.integers(
+            0,
+            n_fountains,
+            size=n_fountains,
+        )
+
+        Z_sample = Z_stack[sample_idx]
+        w_sample = weights_all[sample_idx]
+
+        try:
+            aggregate_Z = nan_weighted_mean_stack(
+                Z_sample,
+                weights=w_sample,
+            )
+
+            row, fit, fit_cache, pred_upper, pred_full = fit_matrix_same_settings(
+                aggregate_Z,
+                fit_kwargs=fit_kwargs,
+                compute_nrmse=True,
+                nrmse_normalization=nrmse_normalization,
+                peak_radius_kb=peak_radius_kb,
+                full_nrmse_mirror=full_nrmse_mirror,
+            )
+
+            row["bootstrap_id"] = b
+            row["n_sampled_fountains"] = int(n_fountains)
+            row["n_unique_fountains"] = int(len(np.unique(sample_idx)))
+            row["status"] = "ok"
+
+            rows.append(row)
+
+            if return_matrices:
+                aggregates.append(aggregate_Z)
+                predictions.append(pred_upper)
+
+        except Exception as e:
+            rows.append(
+                {
+                    "bootstrap_id": b,
+                    "n_sampled_fountains": int(n_fountains),
+                    "n_unique_fountains": int(len(np.unique(sample_idx))),
+                    "status": "failed",
+                    "error": repr(e),
+                }
+            )
+
+    result = {
+        "boot_df": pd.DataFrame(rows),
+    }
+
+    if return_matrices:
+        result["aggregates"] = aggregates
+        result["predictions"] = predictions
+
+    return result
+
+
+def fit_aggregate_same_settings(
+    Z_stack,
+    fit_kwargs,
+    weights=None,
+    nrmse_normalization="range",
+    peak_radius_kb=60,
+    full_nrmse_mirror=False,
+):
+    """
+    Метод 3:
+    строим aggregate из того же набора фонтанов,
+    затем фитим его теми же настройками.
+    """
+
+    aggregate_Z = nan_weighted_mean_stack(
+        Z_stack,
+        weights=weights,
+    )
+
+    row, fit, fit_cache, pred_upper, pred_full = fit_matrix_same_settings(
+        aggregate_Z,
+        fit_kwargs=fit_kwargs,
+        compute_nrmse=True,
+        nrmse_normalization=nrmse_normalization,
+        peak_radius_kb=peak_radius_kb,
+        full_nrmse_mirror=full_nrmse_mirror,
+    )
+
+    row["status"] = "ok"
+
+    return {
+        "aggregate_Z": aggregate_Z,
+        "row": row,
+        "fit": fit,
+        "fit_cache": fit_cache,
+        "pred_upper": pred_upper,
+        "pred_full": pred_full,
+    }
+
+
+def summarize_distribution_method(
+    df,
+    method,
+    n_fountains,
+    peak_radius_kb=60,
+    include_nrmse=True,
+):
+    """
+    Summary для методов, где есть распределение фитов:
+        - individual fits;
+        - bootstrap fits.
+    """
+
+    if df is None or len(df) == 0:
+        ok = pd.DataFrame()
+    else:
+        ok = df[df["status"] == "ok"].copy()
+
+    out = {
+        "method": method,
+        "n_fountains": int(n_fountains),
+        "n_success": int(len(ok)),
+    }
+
+    for col, out_name in [
+        ("r", "r"),
+        ("a_kb", "a_kb"),
+        ("b_kb", "b_kb"),
+        ("p_kb", "p_kb"),
+    ]:
+        mean, std = _mean_std(ok[col]) if col in ok.columns else (np.nan, np.nan)
+        out[out_name] = mean
+        out[f"std_{out_name}"] = std
+
+    peak_col = f"nrmse_peak_pm{int(peak_radius_kb)}kb"
+
+    if include_nrmse:
+        mean, std = (
+            _mean_std(ok[peak_col])
+            if peak_col in ok.columns
+            else (np.nan, np.nan)
+        )
+        out[f"nrmse_pm{int(peak_radius_kb)}kb"] = mean
+        out[f"std_nrmse_pm{int(peak_radius_kb)}kb"] = std
+
+        mean, std = (
+            _mean_std(ok["nrmse_full_map"])
+            if "nrmse_full_map" in ok.columns
+            else (np.nan, np.nan)
+        )
+        out["nrmse_full"] = mean
+        out["std_nrmse_full"] = std
+
+    else:
+        out[f"nrmse_pm{int(peak_radius_kb)}kb"] = np.nan
+        out[f"std_nrmse_pm{int(peak_radius_kb)}kb"] = np.nan
+        out["nrmse_full"] = np.nan
+        out["std_nrmse_full"] = np.nan
+
+    return out
+
+
+def summarize_single_aggregate_method(
+    row,
+    method,
+    n_fountains,
+    peak_radius_kb=60,
+):
+    """
+    Summary для одного aggregate fit.
+
+    std_r здесь берётся как local fit uncertainty r_se.
+    Для bootstrap лучше использовать bootstrap std.
+    """
+
+    peak_col = f"nrmse_peak_pm{int(peak_radius_kb)}kb"
+
+    return {
+        "method": method,
+        "n_fountains": int(n_fountains),
+        "n_success": 1,
+
+        "r": _safe_float(row.get("r")),
+        "std_r": _safe_float(row.get("r_se")),
+
+        "a_kb": _safe_float(row.get("a_kb")),
+        "std_a_kb": _safe_float(row.get("a_se_kb")),
+
+        "b_kb": _safe_float(row.get("b_kb")),
+        "std_b_kb": _safe_float(row.get("b_se_kb")),
+
+        "p_kb": _safe_float(row.get("p_kb")),
+        "std_p_kb": _safe_float(row.get("p_se_kb")),
+
+        f"nrmse_pm{int(peak_radius_kb)}kb": _safe_float(row.get(peak_col)),
+        f"std_nrmse_pm{int(peak_radius_kb)}kb": np.nan,
+
+        "nrmse_full": _safe_float(row.get("nrmse_full_map")),
+        "std_nrmse_full": np.nan,
+    }
+
+
+def compare_fountain_fit_methods_same_settings(
+    Z_stack,
+    used_df=None,
+    fit_kwargs=None,
+
+    # Только для individual fits
+    individual_top_n=None,
+    individual_score_col="Fountain Score",
+
+    # Для bootstrap + aggregate.
+    # По умолчанию None, то есть все фонтаны.
+    bootstrap_aggregate_top_n=None,
+    bootstrap_aggregate_score_col="Fountain Score",
+
+    weights=None,
+    n_boot=500,
+    random_state=1,
+    nrmse_normalization="range",
+    peak_radius_kb=60,
+    full_nrmse_mirror=False,
+    compute_individual_nrmse=False,
+):
+    """
+    Единая функция для трёх оценок:
+
+    1. individual:
+        fit каждого индивидуального фонтана.
+        Можно ограничить top-score N через individual_top_n.
+
+    2. bootstrap:
+        bootstrap по фонтанам.
+        По умолчанию использует все фонтаны.
+
+    3. aggregate:
+        fit aggregate.
+        По умолчанию использует все фонтаны.
+
+    Важно:
+    Все три метода используют один и тот же fit_kwargs.
+    """
+
+    if fit_kwargs is None:
+        raise ValueError("Нужно явно передать fit_kwargs.")
+
+    fit_kwargs = dict(fit_kwargs)
+
+    # ============================================================
+    # 1. Subset для individual fits
+    # ============================================================
+
+    Z_ind, used_ind, weights_ind, idx_ind = select_fountain_subset(
+        Z_stack=Z_stack,
+        used_df=used_df,
+        top_n=individual_top_n,
+        score_col=individual_score_col,
+        weights=weights,
+    )
+
+    # ============================================================
+    # 2. Subset для bootstrap + aggregate
+    #    По умолчанию это все фонтаны.
+    # ============================================================
+
+    Z_ba, used_ba, weights_ba, idx_ba = select_fountain_subset(
+        Z_stack=Z_stack,
+        used_df=used_df,
+        top_n=bootstrap_aggregate_top_n,
+        score_col=bootstrap_aggregate_score_col,
+        weights=weights,
+    )
+
+    n_individual = Z_ind.shape[0]
+    n_bootstrap_aggregate = Z_ba.shape[0]
+
+    # ============================================================
+    # Method 1: individual fits
+    # ============================================================
+
+    individual_df = fit_individual_fountains_same_settings(
+        Z_stack=Z_ind,
+        fit_kwargs=fit_kwargs,
+        compute_nrmse=compute_individual_nrmse,
+        nrmse_normalization=nrmse_normalization,
+        peak_radius_kb=peak_radius_kb,
+        full_nrmse_mirror=full_nrmse_mirror,
+    )
+
+    # Сохраняем исходный индекс фонтана в полном Z_stack
+    if len(individual_df) > 0 and "fountain_i" in individual_df.columns:
+        local_i = individual_df["fountain_i"].to_numpy(dtype=int)
+        individual_df["source_fountain_i"] = idx_ind[local_i]
+
+    # ============================================================
+    # Method 2: bootstrap
+    # ============================================================
+
+    bootstrap_result = bootstrap_fountains_same_settings(
+        Z_stack=Z_ba,
+        fit_kwargs=fit_kwargs,
+        weights=weights_ba,
+        n_boot=n_boot,
+        random_state=random_state,
+        nrmse_normalization=nrmse_normalization,
+        peak_radius_kb=peak_radius_kb,
+        full_nrmse_mirror=full_nrmse_mirror,
+        return_matrices=False,
+    )
+
+    # ============================================================
+    # Method 3: aggregate fit
+    # ============================================================
+
+    aggregate_result = fit_aggregate_same_settings(
+        Z_stack=Z_ba,
+        fit_kwargs=fit_kwargs,
+        weights=weights_ba,
+        nrmse_normalization=nrmse_normalization,
+        peak_radius_kb=peak_radius_kb,
+        full_nrmse_mirror=full_nrmse_mirror,
+    )
+
+    # ============================================================
+    # Summaries
+    # ============================================================
+
+    individual_summary = summarize_distribution_method(
+        individual_df,
+        method="individual_fits",
+        n_fountains=n_individual,
+        peak_radius_kb=peak_radius_kb,
+        include_nrmse=compute_individual_nrmse,
+    )
+
+    individual_summary["subset"] = (
+        f"top {individual_top_n} by {individual_score_col}"
+        if individual_top_n is not None
+        else "all"
+    )
+
+    bootstrap_summary = summarize_distribution_method(
+        bootstrap_result["boot_df"],
+        method="bootstrap",
+        n_fountains=n_bootstrap_aggregate,
+        peak_radius_kb=peak_radius_kb,
+        include_nrmse=True,
+    )
+
+    bootstrap_summary["subset"] = (
+        f"top {bootstrap_aggregate_top_n} by {bootstrap_aggregate_score_col}"
+        if bootstrap_aggregate_top_n is not None
+        else "all"
+    )
+
+    aggregate_summary = summarize_single_aggregate_method(
+        aggregate_result["row"],
+        method="aggregate_fit",
+        n_fountains=n_bootstrap_aggregate,
+        peak_radius_kb=peak_radius_kb,
+    )
+
+    aggregate_summary["subset"] = (
+        f"top {bootstrap_aggregate_top_n} by {bootstrap_aggregate_score_col}"
+        if bootstrap_aggregate_top_n is not None
+        else "all"
+    )
+
+    summary_df = pd.DataFrame(
+        [
+            individual_summary,
+            bootstrap_summary,
+            aggregate_summary,
+        ]
+    )
+
+    return {
+        "summary": summary_df,
+
+        "individual_df": individual_df,
+        "bootstrap_df": bootstrap_result["boot_df"],
+        "aggregate_result": aggregate_result,
+
+        "used_individual_df": used_ind,
+        "used_bootstrap_aggregate_df": used_ba,
+
+        "selected_idx_individual": idx_ind,
+        "selected_idx_bootstrap_aggregate": idx_ba,
+
+        "fit_kwargs": fit_kwargs,
+    }
+
+def gaussian_shape_from_abp(a, b, p, X, Y):
+    """
+    Gaussian shape without amplitude/background:
+        F = exp(-((X+Y)^2/a^2 + (X-Y-2p)^2/b^2))
+    """
+    a = max(float(a), 1e-12)
+    b = max(float(b), 1e-12)
+    p = float(p)
+
+    return np.exp(
+        -(
+            ((X + Y) ** 2) / (a ** 2)
+            + ((X - Y - 2.0 * p) ** 2) / (b ** 2)
+        )
+    )
+
+
+def refit_A_C_linear(Z, F, mask, force_A_nonnegative=True):
+    """
+    Для фиксированных a,b,p оптимально подбирает A и C:
+        Z ≈ C + A * F
+
+    Это делает scan быстрым: мы сканируем только shape-параметры a,b,p,
+    а A,C считаем аналитически как nuisance parameters.
+    """
+    Z = np.asarray(Z, dtype=float)
+    F = np.asarray(F, dtype=float)
+
+    valid = mask & np.isfinite(Z) & np.isfinite(F)
+
+    z = Z[valid]
+    f = F[valid]
+
+    if len(z) < 5:
+        return np.nan, np.nan
+
+    X_design = np.column_stack([f, np.ones_like(f)])
+
+    A, C = np.linalg.lstsq(X_design, z, rcond=None)[0]
+
+    if force_A_nonnegative and A < 0:
+        A = 0.0
+        C = float(np.nanmean(z))
+
+    return float(A), float(C)
+
+
+def r_from_a_b(a, b):
+    a = float(a)
+    b = float(b)
+    return float((b**2 - a**2) / (b**2 + a**2))
+
+
+def scan_gaussian_nrmse_tolerance_region(
+    aggregate_Z,
+    fit,
+    fit_cache,
+    fit_kwargs=None,
+
+    rel_tol=0.03,
+
+    # Which NRMSE defines the accepted region
+    score_mode="peak60",   # "peak60" or "full"
+
+    # NRMSE settings
+    nrmse_normalization="range",
+    full_mode="finite_all",
+    peak_radius_kb=60,
+    full_nrmse_mirror=False,
+
+    # Scan ranges around best fit
+    a_rel_span=(0.5, 2.0),
+    b_rel_span=(0.5, 2.0),
+    p_span_kb=50,
+
+    n_a=45,
+    n_b=45,
+    n_p=41,
+
+    force_A_nonnegative=True,
+    use_log_grid_for_widths=True,
+):
+    """
+    Scans Gaussian parameter space around the best fit.
+
+    Returns all candidates whose NRMSE is within:
+        min_NRMSE * (1 + rel_tol)
+
+    This is not a statistical confidence interval.
+    It is a robustness / identifiability region.
+    """
+
+    Z = np.asarray(aggregate_Z, dtype=float)
+    n = Z.shape[0]
+
+    ctx = fit_cache.get(n)
+    X = ctx["X"]
+    Y = ctx["Y"]
+
+    a0 = float(fit["a_kb"])
+    b0 = float(fit["b_kb"])
+    p0 = float(fit["p_kb"])
+
+    if fit_kwargs is None:
+        fit_kwargs = {}
+
+    # Respect original p bounds if available
+    p_center = float(fit_kwargs.get("p0_kb", p0))
+    p_half_window = float(fit_kwargs.get("p_half_window_kb", np.inf))
+
+    p_low_bound = p_center - p_half_window
+    p_high_bound = p_center + p_half_window
+
+    p_low = max(p0 - p_span_kb, p_low_bound)
+    p_high = min(p0 + p_span_kb, p_high_bound)
+
+    if use_log_grid_for_widths:
+        a_values = np.exp(
+            np.linspace(
+                np.log(a0 * a_rel_span[0]),
+                np.log(a0 * a_rel_span[1]),
+                n_a,
+            )
+        )
+        b_values = np.exp(
+            np.linspace(
+                np.log(b0 * b_rel_span[0]),
+                np.log(b0 * b_rel_span[1]),
+                n_b,
+            )
+        )
+    else:
+        a_values = np.linspace(a0 * a_rel_span[0], a0 * a_rel_span[1], n_a)
+        b_values = np.linspace(b0 * b_rel_span[0], b0 * b_rel_span[1], n_b)
+
+    p_values = np.linspace(p_low, p_high, n_p)
+
+    # Masks from fitted peak
+    full_mask, peak_mask = make_gaussian_fit_masks(
+        Z=Z,
+        fit=fit,
+        fit_cache=fit_cache,
+        full_mode=full_mode,
+        peak_radius_kb=peak_radius_kb,
+    )
+
+    # For fitting A,C, use the same mask as the score.
+    # Usually peak60 is better, otherwise full map can be dominated by background.
+    if score_mode == "peak60":
+        score_mask = peak_mask
+    elif score_mode == "full":
+        score_mask = full_mask
+    else:
+        raise ValueError("score_mode должен быть 'peak60' или 'full'.")
+
+    rows = []
+
+    for p in tqdm(p_values, desc="Scanning p"):
+        for a in a_values:
+            for b in b_values:
+                F = gaussian_shape_from_abp(a, b, p, X, Y)
+
+                A, C = refit_A_C_linear(
+                    Z=Z,
+                    F=F,
+                    mask=score_mask,
+                    force_A_nonnegative=force_A_nonnegative,
+                )
+
+                if not np.isfinite(A) or not np.isfinite(C):
+                    continue
+
+                pred = C + A * F
+
+                if full_nrmse_mirror:
+                    pred_full = C + np.maximum(pred - C, pred.T - C)
+                else:
+                    pred_full = pred
+
+                nrmse_full, rmse_full, n_full = calculate_nrmse(
+                    Z,
+                    pred_full,
+                    full_mask,
+                    normalization=nrmse_normalization,
+                )
+
+                nrmse_peak, rmse_peak, n_peak = calculate_nrmse(
+                    Z,
+                    pred,
+                    peak_mask,
+                    normalization=nrmse_normalization,
+                )
+
+                if score_mode == "peak60":
+                    score = nrmse_peak
+                else:
+                    score = nrmse_full
+
+                rows.append(
+                    {
+                        "a_kb": float(a),
+                        "b_kb": float(b),
+                        "p_kb": float(p),
+                        "A": float(A),
+                        "C": float(C),
+
+                        "r": r_from_a_b(a, b),
+
+                        "nrmse_peak_pm60kb": nrmse_peak,
+                        "rmse_peak_pm60kb": rmse_peak,
+                        "n_pixels_peak_pm60kb": n_peak,
+
+                        "nrmse_full_map": nrmse_full,
+                        "rmse_full_map": rmse_full,
+                        "n_pixels_full_map": n_full,
+
+                        "score": score,
+                    }
+                )
+
+    landscape_df = pd.DataFrame(rows)
+
+    if len(landscape_df) == 0:
+        raise RuntimeError("Scan returned no valid candidates.")
+
+    min_score = float(np.nanmin(landscape_df["score"]))
+    threshold = min_score * (1.0 + rel_tol)
+
+    accepted_df = landscape_df[
+        np.isfinite(landscape_df["score"])
+        & (landscape_df["score"] <= threshold)
+    ].copy()
+
+    best_row = landscape_df.loc[landscape_df["score"].idxmin()].copy()
+
+    summary = {
+        "score_mode": score_mode,
+        "rel_tol": float(rel_tol),
+        "min_score": min_score,
+        "threshold": threshold,
+
+        "n_scanned": int(len(landscape_df)),
+        "n_accepted": int(len(accepted_df)),
+        "accepted_fraction": float(len(accepted_df) / len(landscape_df)),
+
+        "best_r": float(best_row["r"]),
+        "best_a_kb": float(best_row["a_kb"]),
+        "best_b_kb": float(best_row["b_kb"]),
+        "best_p_kb": float(best_row["p_kb"]),
+
+        "r_min_accepted": float(np.nanmin(accepted_df["r"])),
+        "r_max_accepted": float(np.nanmax(accepted_df["r"])),
+
+        "a_min_accepted": float(np.nanmin(accepted_df["a_kb"])),
+        "a_max_accepted": float(np.nanmax(accepted_df["a_kb"])),
+
+        "b_min_accepted": float(np.nanmin(accepted_df["b_kb"])),
+        "b_max_accepted": float(np.nanmax(accepted_df["b_kb"])),
+
+        "p_min_accepted": float(np.nanmin(accepted_df["p_kb"])),
+        "p_max_accepted": float(np.nanmax(accepted_df["p_kb"])),
+    }
+
+    return {
+        "summary": summary,
+        "landscape_df": landscape_df,
+        "accepted_df": accepted_df,
+        "best_row": best_row,
+    }
+
+def gaussian_shape_from_abp(a, b, p, X, Y):
+    """
+    Gaussian shape without amplitude/background:
+        F = exp(-((X+Y)^2/a^2 + (X-Y-2p)^2/b^2))
+    """
+    a = max(float(a), 1e-12)
+    b = max(float(b), 1e-12)
+    p = float(p)
+
+    return np.exp(
+        -(
+            ((X + Y) ** 2) / (a ** 2)
+            + ((X - Y - 2.0 * p) ** 2) / (b ** 2)
+        )
+    )
+
+
+def refit_A_C_linear(Z, F, mask, force_A_nonnegative=True):
+    """
+    Для фиксированных a,b,p оптимально подбирает A и C:
+        Z ≈ C + A * F
+
+    Это делает scan быстрым: мы сканируем только shape-параметры a,b,p,
+    а A,C считаем аналитически как nuisance parameters.
+    """
+    Z = np.asarray(Z, dtype=float)
+    F = np.asarray(F, dtype=float)
+
+    valid = mask & np.isfinite(Z) & np.isfinite(F)
+
+    z = Z[valid]
+    f = F[valid]
+
+    if len(z) < 5:
+        return np.nan, np.nan
+
+    X_design = np.column_stack([f, np.ones_like(f)])
+
+    A, C = np.linalg.lstsq(X_design, z, rcond=None)[0]
+
+    if force_A_nonnegative and A < 0:
+        A = 0.0
+        C = float(np.nanmean(z))
+
+    return float(A), float(C)
+
+
+def r_from_a_b(a, b):
+    a = float(a)
+    b = float(b)
+    return float((b**2 - a**2) / (b**2 + a**2))
+
+
+def scan_gaussian_nrmse_tolerance_region(
+    aggregate_Z,
+    fit,
+    fit_cache,
+    fit_kwargs=None,
+
+    nrmse_delta=0.03,
+
+    # Which NRMSE defines the accepted region
+    score_mode="peak60",   # "peak60" or "full"
+
+    # NRMSE settings
+    nrmse_normalization="range",
+    full_mode="finite_all",
+    peak_radius_kb=60,
+    full_nrmse_mirror=False,
+
+    # Scan ranges around best fit
+    a_rel_span=(0.5, 2.0),
+    b_rel_span=(0.5, 2.0),
+    p_span_kb=50,
+
+    n_a=45,
+    n_b=45,
+    n_p=41,
+
+    force_A_nonnegative=True,
+    use_log_grid_for_widths=True,
+):
+    """
+    Scans Gaussian parameter space around the best fit.
+
+    Returns all candidates whose NRMSE satisfies:
+
+        NRMSE <= sqrt(NRMSE_min^2 + nrmse_delta^2)
+
+    This is not a statistical confidence interval.
+    It is a robustness / identifiability region.
+    """
+
+    Z = np.asarray(aggregate_Z, dtype=float)
+    n = Z.shape[0]
+
+    ctx = fit_cache.get(n)
+    X = ctx["X"]
+    Y = ctx["Y"]
+
+    a0 = float(fit["a_kb"])
+    b0 = float(fit["b_kb"])
+    p0 = float(fit["p_kb"])
+
+    if fit_kwargs is None:
+        fit_kwargs = {}
+
+    # Respect original p bounds if available
+    p_center = float(fit_kwargs.get("p0_kb", p0))
+    p_half_window = float(fit_kwargs.get("p_half_window_kb", np.inf))
+
+    p_low_bound = p_center - p_half_window
+    p_high_bound = p_center + p_half_window
+
+    p_low = max(p0 - p_span_kb, p_low_bound)
+    p_high = min(p0 + p_span_kb, p_high_bound)
+
+    if use_log_grid_for_widths:
+        a_values = np.exp(
+            np.linspace(
+                np.log(a0 * a_rel_span[0]),
+                np.log(a0 * a_rel_span[1]),
+                n_a,
+            )
+        )
+        b_values = np.exp(
+            np.linspace(
+                np.log(b0 * b_rel_span[0]),
+                np.log(b0 * b_rel_span[1]),
+                n_b,
+            )
+        )
+    else:
+        a_values = np.linspace(a0 * a_rel_span[0], a0 * a_rel_span[1], n_a)
+        b_values = np.linspace(b0 * b_rel_span[0], b0 * b_rel_span[1], n_b)
+
+    p_values = np.linspace(p_low, p_high, n_p)
+
+    # Masks from fitted peak
+    full_mask, peak_mask = make_gaussian_fit_masks(
+        Z=Z,
+        fit=fit,
+        fit_cache=fit_cache,
+        full_mode=full_mode,
+        peak_radius_kb=peak_radius_kb,
+    )
+
+    # For fitting A,C, use the same mask as the score.
+    # Usually peak60 is better, otherwise full map can be dominated by background.
+    if score_mode == "peak60":
+        score_mask = peak_mask
+    elif score_mode == "full":
+        score_mask = full_mask
+    else:
+        raise ValueError("score_mode должен быть 'peak60' или 'full'.")
+
+    rows = []
+
+    for p in tqdm(p_values, desc="Scanning p"):
+        for a in a_values:
+            for b in b_values:
+                F = gaussian_shape_from_abp(a, b, p, X, Y)
+
+                A, C = refit_A_C_linear(
+                    Z=Z,
+                    F=F,
+                    mask=score_mask,
+                    force_A_nonnegative=force_A_nonnegative,
+                )
+
+                if not np.isfinite(A) or not np.isfinite(C):
+                    continue
+
+                pred = C + A * F
+
+                if full_nrmse_mirror:
+                    pred_full = C + np.maximum(pred - C, pred.T - C)
+                else:
+                    pred_full = pred
+
+                nrmse_full, rmse_full, n_full = calculate_nrmse(
+                    Z,
+                    pred_full,
+                    full_mask,
+                    normalization=nrmse_normalization,
+                )
+
+                nrmse_peak, rmse_peak, n_peak = calculate_nrmse(
+                    Z,
+                    pred,
+                    peak_mask,
+                    normalization=nrmse_normalization,
+                )
+
+                if score_mode == "peak60":
+                    score = nrmse_peak
+                else:
+                    score = nrmse_full
+
+                rows.append(
+                    {
+                        "a_kb": float(a),
+                        "b_kb": float(b),
+                        "p_kb": float(p),
+                        "A": float(A),
+                        "C": float(C),
+
+                        "r": r_from_a_b(a, b),
+
+                        "nrmse_peak_pm60kb": nrmse_peak,
+                        "rmse_peak_pm60kb": rmse_peak,
+                        "n_pixels_peak_pm60kb": n_peak,
+
+                        "nrmse_full_map": nrmse_full,
+                        "rmse_full_map": rmse_full,
+                        "n_pixels_full_map": n_full,
+
+                        "score": score,
+                    }
+                )
+
+    landscape_df = pd.DataFrame(rows)
+
+    if len(landscape_df) == 0:
+        raise RuntimeError("Scan returned no valid candidates.")
+
+    min_score = float(np.nanmin(landscape_df["score"]))
+
+    threshold = float(np.sqrt(min_score**2 + nrmse_delta**2))
+
+    accepted_df = landscape_df[
+        np.isfinite(landscape_df["score"])
+        & (landscape_df["score"] <= threshold)
+    ].copy()
+
+    best_row = landscape_df.loc[landscape_df["score"].idxmin()].copy()
+
+    summary = {
+        "score_mode": score_mode,
+
+        "threshold_rule": "sqrt(NRMSE_min^2 + NRMSE_delta^2)",
+        "nrmse_delta": float(nrmse_delta),
+        "min_score": min_score,
+        "threshold": threshold,
+        "absolute_margin": float(threshold - min_score),
+        "relative_margin": float(threshold / min_score - 1.0)
+        if min_score > 0
+        else np.nan,
+
+        "n_scanned": int(len(landscape_df)),
+        "n_accepted": int(len(accepted_df)),
+        "accepted_fraction": float(len(accepted_df) / len(landscape_df)),
+
+        "best_r": float(best_row["r"]),
+        "best_a_kb": float(best_row["a_kb"]),
+        "best_b_kb": float(best_row["b_kb"]),
+        "best_p_kb": float(best_row["p_kb"]),
+
+        "r_min_accepted": float(np.nanmin(accepted_df["r"])),
+        "r_max_accepted": float(np.nanmax(accepted_df["r"])),
+
+        "a_min_accepted": float(np.nanmin(accepted_df["a_kb"])),
+        "a_max_accepted": float(np.nanmax(accepted_df["a_kb"])),
+
+        "b_min_accepted": float(np.nanmin(accepted_df["b_kb"])),
+        "b_max_accepted": float(np.nanmax(accepted_df["b_kb"])),
+
+        "p_min_accepted": float(np.nanmin(accepted_df["p_kb"])),
+        "p_max_accepted": float(np.nanmax(accepted_df["p_kb"])),
+    }
+
+    return {
+        "summary": summary,
+        "landscape_df": landscape_df,
+        "accepted_df": accepted_df,
+        "best_row": best_row,
+    }
+    
+def compute_peak_window_nrmse_from_plot_data(
+    plot_data,
+    orientation="upper",
+    peak_xy_kb=None,
+    peak_x_kb=None,
+    peak_y_kb=None,
+    window_size_kb=80.0,
+    half_window_kb=None,
+):
+    """
+    Считает NRMSE между нормированной aggregate Hi-C map
+    и нормированной numerical model map в окне вокруг заданного пика.
+
+    peak_xy_kb:
+        центр пика в координатах Hi-C plot, например (40, -40).
+
+    window_size_kb:
+        полный размер квадратного окна.
+        window_size_kb=80 означает окно 80 x 80 kb,
+        то есть half_window_kb=40.
+    """
+
+    if peak_xy_kb is None:
+        if peak_x_kb is None or peak_y_kb is None:
+            raise ValueError(
+                "Нужно передать peak_xy_kb=(x, y) "
+                "или оба параметра peak_x_kb и peak_y_kb."
+            )
+        peak_xy_kb = (peak_x_kb, peak_y_kb)
+
+    if half_window_kb is None:
+        half_window_kb = float(window_size_kb) / 2.0
+
+    return compute_norm_rmse_from_plot_data(
+        plot_data,
+        orientation=orientation,
+        center_xy_kb=peak_xy_kb,
+        half_window_kb=half_window_kb,
+    )
+
+def estimate_hic_peak_xy_from_plot_data(
+    plot_data,
+    orientation="upper",
+    search_center_xy_kb=None,
+    search_window_kb=None,
+    peak_quantile=0.80,
+    min_points=3,
+):
+    """
+    Оценивает положение Hi-C пика по нормированной aggregate map
+    из plot_data["Z_contour"].
+
+    Возвращает центр масс верхних peak_quantile пикселей.
+    """
+
+    Z = np.asarray(plot_data["Z_contour"], dtype=float)
+    X = np.asarray(plot_data["X_grid"], dtype=float)
+    Y = np.asarray(plot_data["Y_grid"], dtype=float)
+
+    mask = np.isfinite(Z) & np.isfinite(X) & np.isfinite(Y)
+
+    if orientation == "upper":
+        mask &= (X >= 0) & (Y <= 0)
+    elif orientation == "lower":
+        mask &= (X <= 0) & (Y >= 0)
+    elif orientation == "both":
+        mask &= (
+            ((X >= 0) & (Y <= 0))
+            | ((X <= 0) & (Y >= 0))
+        )
+    else:
+        raise ValueError("orientation должен быть 'upper', 'lower' или 'both'.")
+
+    if search_center_xy_kb is not None and search_window_kb is not None:
+        cx, cy = search_center_xy_kb
+        mask &= np.abs(X - cx) <= search_window_kb
+        mask &= np.abs(Y - cy) <= search_window_kb
+
+    if mask.sum() < min_points:
+        raise ValueError(
+            f"Слишком мало пикселей для поиска Hi-C пика: {int(mask.sum())}"
+        )
+
+    Z_local = Z[mask]
+    X_local = X[mask]
+    Y_local = Y[mask]
+
+    thr = np.nanquantile(Z_local, peak_quantile)
+    top = Z_local >= thr
+
+    if top.sum() < min_points:
+        raise ValueError(
+            f"Слишком мало top-пикселей для поиска Hi-C пика: {int(top.sum())}"
+        )
+
+    weights = Z_local[top] - thr
+
+    if np.sum(weights) <= 0:
+        weights = np.ones_like(weights)
+
+    peak_x = float(np.average(X_local[top], weights=weights))
+    peak_y = float(np.average(Y_local[top], weights=weights))
+
+    return {
+        "hic_peak_x_kb": peak_x,
+        "hic_peak_y_kb": peak_y,
+        "hic_peak_xy_kb": (peak_x, peak_y),
+        "hic_peak_threshold": float(thr),
+        "hic_peak_n_pixels": int(mask.sum()),
+        "hic_peak_n_top_pixels": int(top.sum()),
+        "peak_quantile": float(peak_quantile),
+    }
+    
+    
+def fit_affine_model_to_data(
+    data,
+    model,
+    X=None,
+    Y=None,
+    orientation="upper",
+    fit_window_kb=None,
+    fit_center_xy_kb=None,
+    mask=None,
+):
+    """
+    Fits data ≈ A + C * model by least squares.
+
+    Parameters
+    ----------
+    data : 2D array
+        Observed map, e.g. smoothed Hi-C aggregate.
+    model : 2D array
+        Model shape on the same grid.
+    X, Y : 2D arrays, optional
+        Coordinates in kb. Used to build orientation/window mask.
+    orientation : {"upper", "lower", "both", None}
+    fit_window_kb : float or None
+        If set, fit only inside a square window.
+    fit_center_xy_kb : tuple or None
+        Center of the fitting window. Default is (0, 0).
+    mask : 2D bool array or None
+        Additional mask.
+
+    Returns
+    -------
+    dict with A, C, fitted_model, residual, rmse, n_pixels, mask.
+    """
+
+    data = np.asarray(data, dtype=float)
+    model = np.asarray(model, dtype=float)
+
+    fit_mask = np.isfinite(data) & np.isfinite(model)
+
+    if X is not None and Y is not None:
+        X = np.asarray(X, dtype=float)
+        Y = np.asarray(Y, dtype=float)
+
+        if orientation == "upper":
+            fit_mask &= (X >= 0) & (Y <= 0)
+        elif orientation == "lower":
+            fit_mask &= (X <= 0) & (Y >= 0)
+        elif orientation == "both":
+            fit_mask &= (
+                ((X >= 0) & (Y <= 0))
+                | ((X <= 0) & (Y >= 0))
+            )
+        elif orientation is None:
+            pass
+        else:
+            raise ValueError(
+                "orientation должен быть 'upper', 'lower', 'both' или None."
+            )
+
+        if fit_window_kb is not None:
+            if fit_center_xy_kb is None:
+                cx, cy = 0.0, 0.0
+            else:
+                cx, cy = fit_center_xy_kb
+
+            fit_mask &= np.abs(X - cx) <= fit_window_kb
+            fit_mask &= np.abs(Y - cy) <= fit_window_kb
+
+    if mask is not None:
+        fit_mask &= np.asarray(mask, dtype=bool)
+
+    if fit_mask.sum() < 3:
+        raise ValueError(
+            f"Too few pixels for affine fit: {int(fit_mask.sum())}"
+        )
+
+    z = data[fit_mask]
+    f = model[fit_mask]
+
+    design = np.column_stack([
+        np.ones_like(f),
+        f,
+    ])
+
+    A, C = np.linalg.lstsq(design, z, rcond=None)[0]
+
+    fitted_model = A + C * model
+    residual = data - fitted_model
+
+    rmse = float(np.sqrt(np.nanmean(residual[fit_mask] ** 2)))
+
+    return {
+        "A": float(A),
+        "C": float(C),
+        "fitted_model": fitted_model,
+        "residual": residual,
+        "rmse": rmse,
+        "n_pixels": int(fit_mask.sum()),
+        "mask": fit_mask,
+    }
+    
+def fit_offset_scale_to_data(
+    data,
+    model,
+    mask,
+    force_positive_scale=True,
+):
+    """
+    Fits data ≈ offset + scale * model on the given mask.
+    """
+
+    data = np.asarray(data, dtype=float)
+    model = np.asarray(model, dtype=float)
+
+    valid = mask & np.isfinite(data) & np.isfinite(model)
+
+    if valid.sum() < 5:
+        raise ValueError(f"Too few pixels for affine fit: {int(valid.sum())}")
+
+    z = data[valid]
+    f = model[valid]
+
+    if np.nanstd(f) < 1e-12:
+        raise ValueError("Model is nearly constant inside the fitting mask.")
+
+    X_design = np.column_stack([
+        np.ones_like(f),
+        f,
+    ])
+
+    offset, scale = np.linalg.lstsq(X_design, z, rcond=None)[0]
+
+    if force_positive_scale and scale < 0:
+        scale = 0.0
+        offset = float(np.nanmean(z))
+
+    fitted_model = offset + scale * model
+    residual = data - fitted_model
+    rmse = float(np.sqrt(np.nanmean(residual[valid] ** 2)))
+
+    return {
+        "offset": float(offset),
+        "scale": float(scale),
+        "fitted_model": fitted_model,
+        "residual": residual,
+        "rmse": rmse,
+        "n_pixels": int(valid.sum()),
+        "mask": valid,
+    }
+    
+def compute_affine_rmse_from_plot_data(
+    plot_data,
+    orientation="upper",
+    window_kb=None,
+    center_xy_kb=None,
+    half_window_kb=None,
+    use_smoothed_hic=True,
+    force_positive_scale=True,
+):
+    """
+    Computes RMSE after fitting
+
+        Hi-C ≈ offset + scale * numerical_model
+
+    inside the selected window.
+    """
+
+    if use_smoothed_hic:
+        Z_data = np.asarray(plot_data["Z_smooth"], dtype=float)
+    else:
+        Z_data = np.asarray(plot_data["Z"], dtype=float)
+
+    X_hic = np.asarray(plot_data["X_grid"], dtype=float)
+    Y_hic = np.asarray(plot_data["Y_grid"], dtype=float)
+
+    num = plot_data["numeric_contour_sets"][0]
+
+    X_model = np.asarray(num["X"], dtype=float)
+    Y_model = np.asarray(num["Y"], dtype=float)
+    P_model = np.asarray(num["Z"], dtype=float)
+
+    x_axis = X_model[0, :]
+    y_axis = Y_model[:, 0]
+
+    P_use = P_model.copy()
+
+    if np.any(np.diff(x_axis) < 0):
+        x_axis = x_axis[::-1]
+        P_use = P_use[:, ::-1]
+
+    if np.any(np.diff(y_axis) < 0):
+        y_axis = y_axis[::-1]
+        P_use = P_use[::-1, :]
+
+    interp = RegularGridInterpolator(
+        (y_axis, x_axis),
+        P_use,
+        bounds_error=False,
+        fill_value=np.nan,
+    )
+
+    pts = np.column_stack([
+        Y_hic.ravel(),
+        X_hic.ravel(),
+    ])
+
+    P_on_hic = interp(pts).reshape(Z_data.shape)
+
+    if orientation == "upper":
+        mask = (X_hic >= 0) & (Y_hic <= 0)
+    elif orientation == "lower":
+        mask = (X_hic <= 0) & (Y_hic >= 0)
+    elif orientation == "both":
+        mask = (
+            ((X_hic >= 0) & (Y_hic <= 0))
+            | ((X_hic <= 0) & (Y_hic >= 0))
+        )
+    else:
+        raise ValueError("orientation должен быть 'upper', 'lower' или 'both'.")
+
+    if window_kb is not None:
+        mask &= np.abs(X_hic) <= window_kb
+        mask &= np.abs(Y_hic) <= window_kb
+
+    if center_xy_kb is not None and half_window_kb is not None:
+        cx, cy = center_xy_kb
+        mask &= np.abs(X_hic - cx) <= half_window_kb
+        mask &= np.abs(Y_hic - cy) <= half_window_kb
+
+    fit_res = fit_offset_scale_to_data(
+        data=Z_data,
+        model=P_on_hic,
+        mask=mask,
+        force_positive_scale=force_positive_scale,
+    )
+
+    fit_res["P_on_hic"] = P_on_hic
+    fit_res["Z_data"] = Z_data
+
+    return fit_res
+    
+    
+def fit_linear_scale_offset(
+    data,
+    model,
+    mask,
+    include_offset=True,
+    force_positive_scale=True,
+):
+    """
+    Fits data ≈ offset + scale * model on mask.
+
+    If include_offset=False, fits data ≈ scale * model.
+    """
+
+    data = np.asarray(data, dtype=float)
+    model = np.asarray(model, dtype=float)
+    mask = np.asarray(mask, dtype=bool)
+
+    valid = mask & np.isfinite(data) & np.isfinite(model)
+
+    if valid.sum() < 5:
+        raise ValueError(f"Too few pixels for linear fit: {int(valid.sum())}")
+
+    z = data[valid]
+    f = model[valid]
+
+    if np.nanstd(f) < 1e-12:
+        raise ValueError("Model is nearly constant inside fit mask.")
+
+    if include_offset:
+        design = np.column_stack([np.ones_like(f), f])
+        offset, scale = np.linalg.lstsq(design, z, rcond=None)[0]
+    else:
+        offset = 0.0
+        scale = np.sum(z * f) / np.sum(f * f)
+
+    if force_positive_scale and scale < 0:
+        scale = 0.0
+        offset = float(np.nanmean(z)) if include_offset else 0.0
+
+    fitted = offset + scale * model
+    resid = data - fitted
+    rmse = float(np.sqrt(np.nanmean(resid[valid] ** 2)))
+
+    return {
+        "offset": float(offset),
+        "scale": float(scale),
+        "fitted": fitted,
+        "residual": resid,
+        "rmse": rmse,
+        "n_pixels": int(valid.sum()),
+        "mask": valid,
+    }
+    
+    
+def interpolate_numeric_to_hic_grid(
+    P_model,
+    X_model,
+    Y_model,
+    X_hic,
+    Y_hic,
+):
+    """
+    Interpolates numerical model map from its own grid to Hi-C grid.
+    """
+
+    P_model = np.asarray(P_model, dtype=float)
+    X_model = np.asarray(X_model, dtype=float)
+    Y_model = np.asarray(Y_model, dtype=float)
+    X_hic = np.asarray(X_hic, dtype=float)
+    Y_hic = np.asarray(Y_hic, dtype=float)
+
+    x_axis = X_model[0, :]
+    y_axis = Y_model[:, 0]
+
+    P_use = P_model.copy()
+
+    if np.any(np.diff(x_axis) < 0):
+        x_axis = x_axis[::-1]
+        P_use = P_use[:, ::-1]
+
+    if np.any(np.diff(y_axis) < 0):
+        y_axis = y_axis[::-1]
+        P_use = P_use[::-1, :]
+
+    interp = RegularGridInterpolator(
+        (y_axis, x_axis),
+        P_use,
+        bounds_error=False,
+        fill_value=np.nan,
+    )
+
+    pts = np.column_stack([
+        Y_hic.ravel(),
+        X_hic.ravel(),
+    ])
+
+    return interp(pts).reshape(X_hic.shape)
+    
+def export_aggregate_fountain(
+    aggregate_Z,
+    res_agg,
+    output_file,
+    x_kb=None,
+    y_kb=None,
+    sheet_prefix="Aggregate",
+):
+    """
+    Выгружает численные данные агрегированного фонтана в Excel.
+
+    Parameters
+    ----------
+    aggregate_Z : 2D array
+        Матрица агрегированного observed/expected-сигнала.
+
+    res_agg : float
+        Размер одного пикселя в kb.
+
+    output_file : str
+        Имя выходного файла, например:
+        "Fig4_Danio_aggregate.xlsx".
+
+    x_kb, y_kb : 1D arrays, optional
+        Точные координаты центров пикселей. Если не заданы,
+        координаты строятся симметрично относительно нуля.
+
+    sheet_prefix : str
+        Префикс названий листов.
+    """
+
+    Z = np.asarray(aggregate_Z, dtype=float)
+
+    if Z.ndim != 2:
+        raise ValueError("aggregate_Z должен быть двумерным массивом.")
+
+    n_y, n_x = Z.shape
+
+    # Координаты центров пикселей относительно основания фонтана
+    if x_kb is None:
+        x_kb = (
+            np.arange(n_x) - (n_x - 1) / 2
+        ) * res_agg
+    else:
+        x_kb = np.asarray(x_kb, dtype=float)
+
+    if y_kb is None:
+        y_kb = (
+            np.arange(n_y) - (n_y - 1) / 2
+        ) * res_agg
+    else:
+        y_kb = np.asarray(y_kb, dtype=float)
+
+    if len(x_kb) != n_x:
+        raise ValueError(
+            "Длина x_kb не совпадает с числом столбцов aggregate_Z."
+        )
+
+    if len(y_kb) != n_y:
+        raise ValueError(
+            "Длина y_kb не совпадает с числом строк aggregate_Z."
+        )
+
+    # ---------------------------------------
+    # Long format: одна строка — один пиксель
+    # ---------------------------------------
+
+    X, Y = np.meshgrid(x_kb, y_kb)
+
+    long_df = pd.DataFrame({
+        "x_kb": X.ravel(),
+        "y_kb": Y.ravel(),
+        "observed_expected": Z.ravel(),
+    })
+
+    # ---------------------------------------
+    # Matrix format
+    # ---------------------------------------
+
+    matrix_df = pd.DataFrame(
+        Z,
+        index=y_kb,
+        columns=x_kb,
+    )
+
+    matrix_df.index.name = "y_kb"
+    matrix_df.columns.name = "x_kb"
+
+    # ---------------------------------------
+    # Metadata
+    # ---------------------------------------
+
+    metadata_df = pd.DataFrame({
+        "Parameter": [
+            "Data type",
+            "Resolution",
+            "Matrix rows",
+            "Matrix columns",
+            "x minimum",
+            "x maximum",
+            "y minimum",
+            "y maximum",
+        ],
+        "Value": [
+            "Aggregated observed/expected fountain",
+            res_agg,
+            n_y,
+            n_x,
+            np.min(x_kb),
+            np.max(x_kb),
+            np.min(y_kb),
+            np.max(y_kb),
+        ],
+        "Units": [
+            "",
+            "kb",
+            "pixels",
+            "pixels",
+            "kb",
+            "kb",
+            "kb",
+            "kb",
+        ],
+    })
+
+    with pd.ExcelWriter(
+        output_file,
+        engine="openpyxl",
+    ) as writer:
+
+        metadata_df.to_excel(
+            writer,
+            sheet_name=f"{sheet_prefix}_info"[:31],
+            index=False,
+        )
+
+        long_df.to_excel(
+            writer,
+            sheet_name=f"{sheet_prefix}_long"[:31],
+            index=False,
+        )
+
+        matrix_df.to_excel(
+            writer,
+            sheet_name=f"{sheet_prefix}_matrix"[:31],
+        )
+
+    return {
+        "long": long_df,
+        "matrix": matrix_df,
+        "metadata": metadata_df,
+    }
+    
+def get_reference_range(F, mask=None, q_low=0.05, q_high=0.995):
+    F = np.asarray(F, dtype=float)
+
+    if mask is None:
+        vals = F[np.isfinite(F)]
+    else:
+        vals = F[np.isfinite(F) & mask]
+
+    if vals.size < 5:
+        raise ValueError(f"Too few finite values for reference range: {vals.size}")
+
+    lo = float(np.nanquantile(vals, q_low))
+    hi = float(np.nanquantile(vals, q_high))
+
+    if not np.isfinite(hi - lo) or hi <= lo:
+        raise ValueError(
+            f"Invalid reference range: lo={lo}, hi={hi}, n={vals.size}"
+        )
+
+    return lo, hi
+
+
+def apply_reference_normalization(F, ref_lo, ref_hi, clip=False):
+    F = np.asarray(F, dtype=float)
+    out = (F - ref_lo) / (ref_hi - ref_lo)
+
+    if clip:
+        out = np.clip(out, 0.0, 1.0)
+
+    return out
+    
+import numpy as np
+import pandas as pd
+
+
+def _pick_col(df, candidates, required=True):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    if required:
+        raise ValueError(
+            "Не нашла ни одной из колонок: "
+            + ", ".join(candidates)
+            + f"\nДоступные колонки: {list(df.columns)}"
+        )
+    return None
+
+
+def _get_feature_mid_bp(hits_df, feature_name="promoter"):
+    """
+    Пытается найти координату feature midpoint в hits_df.
+    Если midpoint нет, считает его из start/end.
+    """
+
+    mid_col = _pick_col(
+        hits_df,
+        [
+            f"{feature_name}_mid_bp",
+            f"{feature_name}_center_bp",
+            f"{feature_name}_bp",
+            "feature_mid_bp",
+            "feature_center_bp",
+            "mid_bp",
+            "center_bp",
+        ],
+        required=False,
+    )
+
+    if mid_col is not None:
+        return hits_df[mid_col].astype(float)
+
+    start_col = _pick_col(
+        hits_df,
+        [
+            f"{feature_name}_start_bp",
+            f"{feature_name}_start",
+            "feature_start_bp",
+            "feature_start",
+            "start_bp",
+            "start",
+        ],
+        required=True,
+    )
+
+    end_col = _pick_col(
+        hits_df,
+        [
+            f"{feature_name}_end_bp",
+            f"{feature_name}_end",
+            "feature_end_bp",
+            "feature_end",
+            "end_bp",
+            "end",
+        ],
+        required=True,
+    )
+
+    return 0.5 * (
+        hits_df[start_col].astype(float)
+        + hits_df[end_col].astype(float)
+    )
+
+
+def make_nearest_promoter_orientation_table(
+    fountains_df,
+    promoter_hits_df,
+    fountain_id_col="Fountain index",
+    chrom_col="chrom",
+    base_col="base_bp",
+    feature_name="promoter",
+):
+    """
+    For each fountain, finds the nearest promoter and decides whether
+    the fountain matrix should be flipped so that the promoter is on the right.
+
+    Convention:
+        promoter_delta_bp = promoter_mid_bp - base_bp
+
+        delta > 0: promoter already on the right, keep matrix
+        delta < 0: promoter on the left, flip matrix as Z[::-1, ::-1]
+    """
+
+    hits = promoter_hits_df.copy()
+
+    # На случай если hits не содержит base_bp/chrom, подтягиваем из fountains_df.
+    needed = [fountain_id_col, chrom_col, base_col]
+    missing = [c for c in needed if c not in hits.columns]
+
+    if missing:
+        hits = hits.merge(
+            fountains_df[needed].drop_duplicates(subset=[fountain_id_col]),
+            on=fountain_id_col,
+            how="left",
+        )
+
+    hits["nearest_promoter_mid_bp"] = _get_feature_mid_bp(
+        hits,
+        feature_name=feature_name,
+    )
+
+    hits["promoter_delta_bp"] = (
+        hits["nearest_promoter_mid_bp"].astype(float)
+        - hits[base_col].astype(float)
+    )
+
+    hits["promoter_abs_delta_bp"] = np.abs(hits["promoter_delta_bp"])
+
+    # Берём ближайший promoter для каждого фонтана.
+    nearest = (
+        hits.sort_values(
+            [fountain_id_col, "promoter_abs_delta_bp"],
+            ascending=[True, True],
+        )
+        .drop_duplicates(subset=[fountain_id_col], keep="first")
+    )
+
+    nearest = nearest[
+        [
+            fountain_id_col,
+            "nearest_promoter_mid_bp",
+            "promoter_delta_bp",
+            "promoter_abs_delta_bp",
+        ]
+    ].copy()
+
+    oriented_df = fountains_df.merge(
+        nearest,
+        on=fountain_id_col,
+        how="left",
+    )
+
+    oriented_df["has_promoter_200kb"] = oriented_df["promoter_delta_bp"].notna()
+
+    # Если promoter слева, разворачиваем фонтан.
+    oriented_df["flip_for_promoter_right"] = (
+        oriented_df["has_promoter_200kb"]
+        & (oriented_df["promoter_delta_bp"] < 0)
+    )
+
+    # После ориентации promoter всегда справа, поэтому signed distance становится положительным.
+    oriented_df["promoter_delta_oriented_bp"] = oriented_df["promoter_abs_delta_bp"]
+
+    return oriented_df
+
+
+def orient_fountain_stack_promoter_right(
+    Z_stack,
+    oriented_df,
+    drop_without_promoter=True,
+):
+    """
+    Applies Z[::-1, ::-1] to fountains whose nearest promoter is on the left.
+    """
+
+    Z_stack = np.asarray(Z_stack, dtype=float)
+
+    if len(Z_stack) != len(oriented_df):
+        raise ValueError(
+            f"len(Z_stack)={len(Z_stack)} != len(oriented_df)={len(oriented_df)}. "
+            "Важно, чтобы порядок Z_stack совпадал с fountains_df/results_df."
+        )
+
+    keep_mask = np.ones(len(oriented_df), dtype=bool)
+
+    if drop_without_promoter:
+        keep_mask &= oriented_df["has_promoter_200kb"].to_numpy(dtype=bool)
+
+    flip_mask = oriented_df["flip_for_promoter_right"].to_numpy(dtype=bool)
+
+    Z_oriented = Z_stack.copy()
+
+    for i in range(len(Z_oriented)):
+        if flip_mask[i]:
+            Z_oriented[i] = Z_oriented[i][::-1, ::-1]
+
+    Z_oriented = Z_oriented[keep_mask]
+    oriented_df_used = oriented_df.loc[keep_mask].copy().reset_index(drop=True)
+
+    return Z_oriented, oriented_df_used
+
+
+def weighted_nanmean_stack(Z_stack, weights=None):
+    """
+    Weighted nanmean across fountains.
+    """
+
+    Z_stack = np.asarray(Z_stack, dtype=float)
+
+    if weights is None:
+        return np.nanmean(Z_stack, axis=0)
+
+    weights = np.asarray(weights, dtype=float)
+
+    if len(weights) != len(Z_stack):
+        raise ValueError(
+            f"len(weights)={len(weights)} != len(Z_stack)={len(Z_stack)}"
+        )
+
+    valid = np.isfinite(Z_stack)
+
+    W = weights[:, None, None] * valid
+    numerator = np.nansum(np.where(valid, Z_stack, 0.0) * weights[:, None, None], axis=0)
+    denominator = np.sum(W, axis=0)
+
+    out = numerator / denominator
+    out[denominator == 0] = np.nan
+
+    return out  
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+def _gaussian_kernel_1d(sigma_bins=1.0, radius=None):
+    if radius is None:
+        radius = int(np.ceil(3 * sigma_bins))
+    x = np.arange(-radius, radius + 1, dtype=float)
+    k = np.exp(-(x**2) / (2 * sigma_bins**2))
+    k /= k.sum()
+    return k
+
+
+def make_promoter_position_strip(
+    promoter_pos_bp,
+    flank_kb,
+    bin_size_kb=5,
+    sigma_kb=5,
+    weights=None,
+    normalize=True,
+):
+    """
+    Строит 1D-strip по положениям ближайшего промотора.
+
+    Parameters
+    ----------
+    promoter_pos_bp : array-like
+        Позиции ближайшего промотора относительно base, уже в ориентированной системе.
+        После orient_fountain_stack_promoter_right они должны быть >= 0.
+    flank_kb : float
+        Полуразмер окна в kb.
+    bin_size_kb : float
+        Размер бина для полоски.
+    sigma_kb : float
+        Сглаживание в kb.
+    weights : array-like or None
+        Веса, если нужно.
+    normalize : bool
+        Нормировать ли трек на максимум.
+
+    Returns
+    -------
+    centers_kb : 1D array
+    strip : 1D array
+    edges_kb : 1D array
+    """
+    promoter_pos_bp = np.asarray(promoter_pos_bp, dtype=float)
+    promoter_pos_kb = promoter_pos_bp / 1000.0
+
+    valid = np.isfinite(promoter_pos_kb)
+    promoter_pos_kb = promoter_pos_kb[valid]
+
+    if weights is not None:
+        weights = np.asarray(weights, dtype=float)[valid]
+
+    edges_kb = np.arange(-flank_kb, flank_kb + bin_size_kb, bin_size_kb)
+    hist, _ = np.histogram(promoter_pos_kb, bins=edges_kb, weights=weights)
+
+    if sigma_kb is not None and sigma_kb > 0:
+        sigma_bins = sigma_kb / bin_size_kb
+        kernel = _gaussian_kernel_1d(sigma_bins=sigma_bins)
+        hist = np.convolve(hist, kernel, mode="same")
+
+    if normalize and np.nanmax(hist) > 0:
+        hist = hist / np.nanmax(hist)
+
+    centers_kb = 0.5 * (edges_kb[:-1] + edges_kb[1:])
+    return centers_kb, hist, edges_kb
+
+def plot_aggregate_with_promoter_strip(
+    aggregate_Z,
+    promoter_strip,
+    flank_kb,
+    cmap_hic="coolwarm",
+    cmap_strip="viridis",
+    vmin=None,
+    vmax=None,
+    title=None,
+):
+    fig = plt.figure(figsize=(6, 6))
+    gs = fig.add_gridspec(
+        nrows=2,
+        ncols=1,
+        height_ratios=[0.35, 5],
+        hspace=0.05,
+    )
+
+    ax_strip = fig.add_subplot(gs[0])
+    ax = fig.add_subplot(gs[1], sharex=ax_strip)
+
+    # ------------------------------------------------------------
+    # main heatmap
+    # ------------------------------------------------------------
+    extent = [-flank_kb, flank_kb, flank_kb, -flank_kb]
+
+    im = ax.imshow(
+        aggregate_Z,
+        origin="upper",
+        extent=extent,
+        cmap=cmap_hic,
+        vmin=vmin,
+        vmax=vmax,
+        aspect="equal",
+        interpolation="nearest",
+    )
+
+    ax.set_xlabel("Distance from fountain base (kb)")
+    ax.set_ylabel("Distance from fountain base (kb)")
+
+    ax.axline((0, 0), slope=1, linestyle="--", color="gray", alpha=0.5, linewidth=0.8)
+    ax.axline((0, 0), slope=-1, linestyle=":", color="gray", alpha=0.5, linewidth=0.8)
+
+    # ------------------------------------------------------------
+    # promoter strip
+    # ------------------------------------------------------------
+    strip_img = promoter_strip[np.newaxis, :]
+
+    ax_strip.imshow(
+        strip_img,
+        aspect="auto",
+        extent=[-flank_kb, flank_kb, 0, 1],
+        origin="lower",
+        cmap=cmap_strip,
+        interpolation="nearest",
+    )
+
+    ax_strip.set_yticks([])
+    ax_strip.set_ylabel("Nearest\npromoter", rotation=0, ha="right", va="center")
+    ax_strip.tick_params(axis="x", labelbottom=False)
+
+    # base
+    ax_strip.axvline(0, color="white", linestyle="--", linewidth=0.8, alpha=0.8)
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Hi-C signal")
+
+    if title is not None:
+        fig.suptitle(title, y=0.98)
+
+    plt.tight_layout()
+    plt.show()
+
+def add_diagonal_feature_strip(
+    ax,
+    feature_pos_bp,
+    flank_kb,
+    bin_size_kb=5,
+    sigma_kb=5,
+    cmap="plasma",
+    linewidth=8,
+    alpha=0.95,
+    normalize=True,
+    zorder=50,
+    label=None,
+):
+    """
+    Рисует feature-density strip вдоль главной диагонали y=x.
+
+    Parameters
+    ----------
+    ax : matplotlib axis
+        Ось с Hi-C heatmap.
+    feature_pos_bp : array-like
+        Позиции feature относительно base в bp.
+        Для promoter-oriented aggregate это promoter_delta_oriented_bp.
+    flank_kb : float
+        Полуразмер окна в kb.
+    bin_size_kb : float
+        Размер бина в kb.
+    sigma_kb : float
+        Сглаживание density strip в kb.
+    cmap : str
+        Colormap.
+    linewidth : float
+        Толщина диагональной полоски.
+    """
+
+    feature_pos_bp = np.asarray(feature_pos_bp, dtype=float)
+    feature_pos_kb = feature_pos_bp / 1000.0
+    feature_pos_kb = feature_pos_kb[np.isfinite(feature_pos_kb)]
+
+    # ограничиваем окном
+    feature_pos_kb = feature_pos_kb[
+        (feature_pos_kb >= -flank_kb) & (feature_pos_kb <= flank_kb)
+    ]
+
+    edges = np.arange(-flank_kb, flank_kb + bin_size_kb, bin_size_kb)
+    hist, _ = np.histogram(feature_pos_kb, bins=edges)
+    hist = hist.astype(float)
+
+    # сглаживание
+    if sigma_kb is not None and sigma_kb > 0:
+        sigma_bins = sigma_kb / bin_size_kb
+        radius = int(np.ceil(3 * sigma_bins))
+        xx = np.arange(-radius, radius + 1, dtype=float)
+        kernel = np.exp(-(xx**2) / (2 * sigma_bins**2))
+        kernel /= kernel.sum()
+        hist = np.convolve(hist, kernel, mode="same")
+
+    if normalize and np.nanmax(hist) > 0:
+        values = hist / np.nanmax(hist)
+    else:
+        values = hist
+
+    # segments along main diagonal y=x
+    segments = []
+    segment_values = []
+
+    for i in range(len(hist)):
+        if not np.isfinite(values[i]):
+            continue
+
+        x0 = edges[i]
+        x1 = edges[i + 1]
+
+        # отрезок вдоль диагонали
+        segments.append([(x0, x0), (x1, x1)])
+        segment_values.append(values[i])
+
+    lc = LineCollection(
+        segments,
+        array=np.asarray(segment_values),
+        cmap=cmap,
+        linewidths=linewidth,
+        alpha=alpha,
+        zorder=zorder,
+        capstyle="butt",
+    )
+
+    ax.add_collection(lc)
+
+    if label is not None:
+        lc.set_label(label)
+
+    return lc, {
+        "edges_kb": edges,
+        "hist": hist,
+        "values": values,
+        "feature_pos_kb": feature_pos_kb,
+    }    
+    
+    
+import numpy as np
+from scipy.ndimage import label, generate_binary_structure
+
+def compute_promoter_side_asymmetry(
+    aggregate_Z,
+    res=5_000,
+    window_kb=None,
+    diag_exclusion_kb=10,
+    baseline=1.0,
+    use_positive_enrichment=True,
+    smooth_sigma=None,
+    largest_component_only=False,
+    component_connectivity=2,
+    symmetrize_component_mask=True,
+):
+    """
+    Computes left-right asymmetry after orienting fountains so that
+    the promoter-rich / promoter-oriented side is on the right.
+
+    Positive asymmetry means stronger signal on the promoter-right side.
+
+    Compares E(x, y) with E(-x, -y), i.e. promoter-side vs opposite-side
+    paired pixels.
+
+    If largest_component_only=True, the asymmetry is computed only within
+    the largest connected component above baseline.
+    """
+
+    import numpy as np
+
+    Z = np.asarray(aggregate_Z, dtype=float)
+
+    # ------------------------------------------------------------
+    # Optional smoothing
+    # ------------------------------------------------------------
+    if smooth_sigma is not None and smooth_sigma > 0:
+        from scipy.ndimage import gaussian_filter
+
+        Z_work = Z.copy()
+        finite = np.isfinite(Z_work)
+
+        if np.any(finite):
+            fill = np.nanmedian(Z_work[finite])
+        else:
+            fill = baseline
+
+        Z_work[~finite] = fill
+        Z_work = gaussian_filter(Z_work, sigma=smooth_sigma)
+    else:
+        Z_work = Z.copy()
+
+    X, Y, coords_kb, extent = make_hic_grid(Z_work, res)
+
+    # ------------------------------------------------------------
+    # Enrichment field
+    # ------------------------------------------------------------
+    if use_positive_enrichment:
+        E = np.maximum(Z_work - baseline, 0.0)
+    else:
+        E = Z_work - baseline
+
+    # 180-degree rotated counterpart: E(-x, -y)
+    E_rot = E[::-1, ::-1]
+
+    # u > 0 means contact midpoint is on promoter-right side
+    U = 0.5 * (X + Y)
+
+    # ------------------------------------------------------------
+    # Base validity / geometry mask
+    # ------------------------------------------------------------
+    valid_mask = np.isfinite(E) & np.isfinite(E_rot)
+
+    # exclude main diagonal y = x
+    valid_mask &= np.abs(X - Y) >= diag_exclusion_kb
+
+    if window_kb is not None:
+        valid_mask &= np.abs(X) <= window_kb
+        valid_mask &= np.abs(Y) <= window_kb
+
+    # ------------------------------------------------------------
+    # Optional: largest connected component above baseline
+    # ------------------------------------------------------------
+    component_mask = np.ones_like(valid_mask, dtype=bool)
+    largest_component_n_pixels = np.nan
+
+    if largest_component_only:
+
+        above_baseline_mask = (
+            np.isfinite(Z_work)
+            & (Z_work > baseline)
+            & valid_mask
+        )
+
+        structure = generate_binary_structure(2, component_connectivity)
+        labeled, n_components = label(above_baseline_mask, structure=structure)
+
+        if n_components == 0:
+            component_mask = np.zeros_like(valid_mask, dtype=bool)
+            largest_component_n_pixels = 0
+        else:
+            component_sizes = np.bincount(labeled.ravel())
+            component_sizes[0] = 0  # background
+
+            largest_label = int(np.argmax(component_sizes))
+            largest_component_n_pixels = int(component_sizes[largest_label])
+
+            component_mask = labeled == largest_label
+
+            # Important for paired comparison E(x,y) vs E(-x,-y):
+            # include the rotated counterpart of the selected component.
+            if symmetrize_component_mask:
+                component_mask = component_mask | component_mask[::-1, ::-1]
+
+    # ------------------------------------------------------------
+    # Asymmetry mask
+    # ------------------------------------------------------------
+    mask = valid_mask.copy()
+
+    # compare only one half to avoid double-counting paired pixels
+    mask &= U > 0
+
+    # restrict to largest component if requested
+    mask &= component_mask
+
+    numerator = np.nansum(E[mask] - E_rot[mask])
+    denominator = np.nansum(E[mask] + E_rot[mask])
+
+    if denominator <= 0 or not np.isfinite(denominator):
+        asymmetry = np.nan
+    else:
+        asymmetry = float(numerator / denominator)
+
+    # ------------------------------------------------------------
+    # Center-of-mass version, useful as a sanity check
+    # ------------------------------------------------------------
+    mask_com = valid_mask.copy()
+    mask_com &= component_mask
+
+    weights = E[mask_com]
+
+    if np.nansum(weights) > 0:
+        u_com_kb = float(
+            np.nansum(U[mask_com] * weights) / np.nansum(weights)
+        )
+        u_abs_mean_kb = float(
+            np.nansum(np.abs(U[mask_com]) * weights) / np.nansum(weights)
+        )
+        u_com_normalized = (
+            u_com_kb / u_abs_mean_kb
+            if u_abs_mean_kb > 0
+            else np.nan
+        )
+    else:
+        u_com_kb = np.nan
+        u_abs_mean_kb = np.nan
+        u_com_normalized = np.nan
+
+    return {
+        "asymmetry": asymmetry,
+        "numerator": float(numerator),
+        "denominator": float(denominator),
+        "n_pixels": int(mask.sum()),
+        "u_com_kb": u_com_kb,
+        "u_abs_mean_kb": u_abs_mean_kb,
+        "u_com_normalized": u_com_normalized,
+        "baseline": baseline,
+        "window_kb": window_kb,
+        "diag_exclusion_kb": diag_exclusion_kb,
+        "largest_component_only": largest_component_only,
+        "largest_component_n_pixels": largest_component_n_pixels,
+        "symmetrize_component_mask": symmetrize_component_mask,
+    }
+    
+import numpy as np
+import pandas as pd
+
+
+def make_promoter_count_orientation_table(
+    fountains_df,
+    promoter_hits_df,
+    fountain_id_col="Fountain index",
+    chrom_col="chrom",
+    base_col="base_bp",
+    feature_name="promoter",
+    tie_strategy="no_flip",  # "no_flip" или "nearest"
+):
+    """
+    Делает oriented_df не по ближайшему промотору, а по количеству промоторов
+    слева/справа от базы фонтана.
+
+    promoter_hits_df должен уже содержать промоторы в нужном окне, например ±200 kb.
+    """
+
+    fountains = fountains_df.copy()
+    hits = promoter_hits_df.copy()
+
+    fountains.columns = fountains.columns.str.strip()
+    hits.columns = hits.columns.str.strip()
+
+    # ------------------------------------------------------------
+    # 1. Находим координату промотора
+    # ------------------------------------------------------------
+    mid_candidates = [
+        f"{feature_name}_mid_bp",
+        f"{feature_name}_center_bp",
+        f"{feature_name}_bp",
+        "feature_mid_bp",
+        "feature_center_bp",
+        "mid_bp",
+        "center_bp",
+    ]
+
+    mid_col = None
+    for c in mid_candidates:
+        if c in hits.columns:
+            mid_col = c
+            break
+
+    if mid_col is not None:
+        hits["promoter_mid_bp_for_orientation"] = hits[mid_col].astype(float)
+    else:
+        start_candidates = [
+            f"{feature_name}_start_bp",
+            f"{feature_name}_start",
+            "feature_start_bp",
+            "feature_start",
+            "start_bp",
+            "start",
+        ]
+        end_candidates = [
+            f"{feature_name}_end_bp",
+            f"{feature_name}_end",
+            "feature_end_bp",
+            "feature_end",
+            "end_bp",
+            "end",
+        ]
+
+        start_col = None
+        end_col = None
+
+        for c in start_candidates:
+            if c in hits.columns:
+                start_col = c
+                break
+
+        for c in end_candidates:
+            if c in hits.columns:
+                end_col = c
+                break
+
+        if start_col is None or end_col is None:
+            raise ValueError(
+                "Не нашла координаты промотора. "
+                f"Доступные колонки promoter_hits_df: {hits.columns.tolist()}"
+            )
+
+        hits["promoter_mid_bp_for_orientation"] = 0.5 * (
+            hits[start_col].astype(float) + hits[end_col].astype(float)
+        )
+
+    # ------------------------------------------------------------
+    # 2. Если в hits нет base_bp, chrom и т.п., подтягиваем из fountains
+    # ------------------------------------------------------------
+    required_fountain_cols = [fountain_id_col, chrom_col, base_col]
+    missing_in_hits = [c for c in required_fountain_cols if c not in hits.columns]
+
+    if missing_in_hits:
+        cols_to_merge = [c for c in required_fountain_cols if c in fountains.columns]
+
+        if fountain_id_col not in cols_to_merge:
+            raise ValueError(
+                f"В fountains_df нет {fountain_id_col}; не могу смержить."
+            )
+
+        hits = hits.merge(
+            fountains[cols_to_merge].drop_duplicates(subset=[fountain_id_col]),
+            on=fountain_id_col,
+            how="left",
+            suffixes=("", "_fountain"),
+        )
+
+    if base_col not in hits.columns:
+        raise ValueError(
+            f"После merge в hits всё равно нет {base_col}. "
+            f"Колонки hits: {hits.columns.tolist()}"
+        )
+
+    # ------------------------------------------------------------
+    # 3. Signed distance промотора до базы
+    # ------------------------------------------------------------
+    hits["promoter_delta_bp"] = (
+        hits["promoter_mid_bp_for_orientation"].astype(float)
+        - hits[base_col].astype(float)
+    )
+
+    hits["promoter_side"] = np.where(
+        hits["promoter_delta_bp"] > 0,
+        "right",
+        np.where(hits["promoter_delta_bp"] < 0, "left", "center"),
+    )
+
+    hits["promoter_abs_delta_bp"] = np.abs(hits["promoter_delta_bp"])
+
+    # ------------------------------------------------------------
+    # 4. Считаем число промоторов слева/справа/в центре для каждого фонтана
+    # ------------------------------------------------------------
+    counts = (
+        hits.pivot_table(
+            index=fountain_id_col,
+            columns="promoter_side",
+            values="promoter_delta_bp",
+            aggfunc="count",
+            fill_value=0,
+        )
+        .reset_index()
+    )
+
+    for c in ["left", "right", "center"]:
+        if c not in counts.columns:
+            counts[c] = 0
+
+    counts = counts.rename(
+        columns={
+            "left": "n_promoters_left_200kb",
+            "right": "n_promoters_right_200kb",
+            "center": "n_promoters_center_200kb",
+        }
+    )
+
+    counts["n_promoters_total_200kb"] = (
+        counts["n_promoters_left_200kb"]
+        + counts["n_promoters_right_200kb"]
+        + counts["n_promoters_center_200kb"]
+    )
+
+    counts["promoter_count_balance_raw"] = (
+        counts["n_promoters_right_200kb"]
+        - counts["n_promoters_left_200kb"]
+    )
+
+    # ------------------------------------------------------------
+    # 5. Для tie_strategy='nearest' ищем ближайший промотор
+    # ------------------------------------------------------------
+    nearest = (
+        hits.sort_values(
+            [fountain_id_col, "promoter_abs_delta_bp"],
+            ascending=[True, True],
+        )
+        .drop_duplicates(subset=[fountain_id_col], keep="first")
+        [[fountain_id_col, "promoter_delta_bp", "promoter_abs_delta_bp"]]
+        .rename(
+            columns={
+                "promoter_delta_bp": "nearest_promoter_delta_bp",
+                "promoter_abs_delta_bp": "nearest_promoter_abs_delta_bp",
+            }
+        )
+    )
+
+    counts = counts.merge(nearest, on=fountain_id_col, how="left")
+
+    # ------------------------------------------------------------
+    # 6. Правило разворота
+    # ------------------------------------------------------------
+    if tie_strategy == "no_flip":
+        counts["flip_for_promoter_right"] = (
+            counts["n_promoters_left_200kb"]
+            > counts["n_promoters_right_200kb"]
+        )
+
+    elif tie_strategy == "nearest":
+        # если слева больше — flip
+        # если справа больше — no flip
+        # если поровну — ориентируем по ближайшему промотору
+        counts["flip_for_promoter_right"] = np.where(
+            counts["n_promoters_left_200kb"] > counts["n_promoters_right_200kb"],
+            True,
+            np.where(
+                counts["n_promoters_left_200kb"] < counts["n_promoters_right_200kb"],
+                False,
+                counts["nearest_promoter_delta_bp"] < 0,
+            ),
+        ).astype(bool)
+
+    else:
+        raise ValueError("tie_strategy должен быть 'no_flip' или 'nearest'.")
+
+    counts["orientation_rule"] = "promoter_count"
+    counts["tie_strategy"] = tie_strategy
+
+    # ------------------------------------------------------------
+    # 7. Считаем ориентированные числа слева/справа после flip
+    # ------------------------------------------------------------
+    counts["n_promoters_right_oriented_200kb"] = np.where(
+        counts["flip_for_promoter_right"],
+        counts["n_promoters_left_200kb"],
+        counts["n_promoters_right_200kb"],
+    )
+
+    counts["n_promoters_left_oriented_200kb"] = np.where(
+        counts["flip_for_promoter_right"],
+        counts["n_promoters_right_200kb"],
+        counts["n_promoters_left_200kb"],
+    )
+
+    counts["promoter_count_balance_oriented"] = (
+        counts["n_promoters_right_oriented_200kb"]
+        - counts["n_promoters_left_oriented_200kb"]
+    )
+
+    counts["has_promoter_200kb"] = counts["n_promoters_total_200kb"] > 0
+
+    # для совместимости со старой логикой оставим эти поля
+    counts["promoter_delta_bp"] = counts["nearest_promoter_delta_bp"]
+    counts["promoter_abs_delta_bp"] = counts["nearest_promoter_abs_delta_bp"]
+    counts["promoter_delta_oriented_bp"] = np.where(
+        counts["flip_for_promoter_right"],
+        -counts["nearest_promoter_delta_bp"],
+        counts["nearest_promoter_delta_bp"],
+    )
+
+    # ------------------------------------------------------------
+    # 8. Возвращаем oriented_df в том же порядке, что fountains_df
+    # ------------------------------------------------------------
+    oriented_df = fountains.merge(
+        counts,
+        on=fountain_id_col,
+        how="left",
+    )
+
+    # фонтаны без промоторов
+    fill_zero_cols = [
+        "n_promoters_left_200kb",
+        "n_promoters_right_200kb",
+        "n_promoters_center_200kb",
+        "n_promoters_total_200kb",
+        "n_promoters_right_oriented_200kb",
+        "n_promoters_left_oriented_200kb",
+        "promoter_count_balance_raw",
+        "promoter_count_balance_oriented",
+    ]
+
+    for c in fill_zero_cols:
+        if c in oriented_df.columns:
+            oriented_df[c] = oriented_df[c].fillna(0).astype(int)
+
+    oriented_df["has_promoter_200kb"] = oriented_df["has_promoter_200kb"].fillna(False)
+    oriented_df["flip_for_promoter_right"] = oriented_df["flip_for_promoter_right"].fillna(False)
+
+    return oriented_df
+    
+
+def make_enhancer_density_segments(
+    enhancer_hits,
+    plot_window_kb,
+    bin_width_kb=5,
+    fountain_id_col="Fountain index",
+    enhancer_id_col="enhancer_feature_id",
+    start_col="enhancer_rel_start_kb",
+    end_col="enhancer_rel_end_kb",
+    center_col="enhancer_rel_center_kb",
+    use_intervals=True,
+):
+    """
+    Делает плотность энхансеров вдоль главной диагонали.
+
+    Возвращает:
+        segments : список отрезков [(x0,y0), (x1,y1)] на линии x=y
+        density  : число энхансеров в каждом bin
+        edges    : границы bin-ов
+        centers  : центры bin-ов
+
+    Если use_intervals=True:
+        энхансер засчитывается во все бины, которые пересекает его интервал.
+
+    Если use_intervals=False:
+        энхансер засчитывается только по center.
+    """
+
+    df = enhancer_hits.copy()
+
+    # ВАЖНО: если на вход пришел ep_contacts, там enhancer может повторяться
+    # много раз из-за разных промоторов.
+    dedup_cols = [
+        c for c in [fountain_id_col, enhancer_id_col, start_col, end_col, center_col]
+        if c in df.columns
+    ]
+
+    df = df[dedup_cols].drop_duplicates().copy()
+
+    edges = np.arange(
+        -plot_window_kb,
+        plot_window_kb + bin_width_kb,
+        bin_width_kb,
+    )
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    density = np.zeros(len(centers), dtype=float)
+
+    if use_intervals and start_col in df.columns and end_col in df.columns:
+        for _, row in df.iterrows():
+            s = float(row[start_col])
+            e = float(row[end_col])
+
+            lo = max(min(s, e), -plot_window_kb)
+            hi = min(max(s, e), plot_window_kb)
+
+            if hi < -plot_window_kb or lo > plot_window_kb:
+                continue
+
+            i0 = np.searchsorted(edges, lo, side="right") - 1
+            i1 = np.searchsorted(edges, hi, side="left")
+
+            i0 = max(i0, 0)
+            i1 = min(i1, len(centers) - 1)
+
+            if i1 >= i0:
+                density[i0:i1 + 1] += 1
+
+    else:
+        x = df[center_col].to_numpy(dtype=float)
+        x = x[np.isfinite(x)]
+        x = x[(x >= -plot_window_kb) & (x <= plot_window_kb)]
+        density, _ = np.histogram(x, bins=edges)
+
+    segments = [
+        [(edges[i], edges[i]), (edges[i + 1], edges[i + 1])]
+        for i in range(len(centers))
+    ]
+
+    return segments, density, edges, centers
+    
+def gaussian_with_background(x, amplitude, mu, sigma, background):
+    """
+    Gaussian profile with a constant background.
+    """
+    return (
+        background
+        + amplitude * np.exp(
+            -0.5 * ((x - mu) / sigma) ** 2
+        )
+    )
+
+
+def fit_enhancer_density_gaussian(
+    enhancer_hits,
+    plot_window_kb,
+    bin_width_kb=5,
+    fountain_id_col="Fountain index",
+    enhancer_id_col="enhancer_feature_id",
+    start_col="enhancer_rel_start_kb",
+    end_col="enhancer_rel_end_kb",
+    center_col="enhancer_rel_center_kb",
+    use_intervals=False,
+    weighted_fit=True,
+    ax=None,
+    title="Enhancer distribution",
+):
+    """
+    Строит распределение энхансеров относительно основания фонтана,
+    фитирует его гауссовской функцией и рисует гистограмму с fitted-кривой.
+
+    Parameters
+    ----------
+    enhancer_hits : pandas.DataFrame
+        Таблица с положениями энхансеров относительно основания фонтана.
+
+    plot_window_kb : float
+        Анализируемое окно: от -plot_window_kb до +plot_window_kb.
+
+    bin_width_kb : float
+        Ширина бина в kb.
+
+    use_intervals : bool
+        False:
+            каждый энхансер учитывается один раз по координате центра;
+            это обычная гистограмма распределения.
+
+        True:
+            энхансер учитывается во всех бинах, пересекаемых его интервалом;
+            это профиль плотности интервалов.
+
+    weighted_fit : bool
+        Если True, учитывается пуассоновская погрешность числа наблюдений:
+        sigma_y ~ sqrt(N + 1).
+
+    Returns
+    -------
+    result : dict
+        Параметры фита, стандартные ошибки, исходная гистограмма
+        и рассчитанная гауссовская кривая.
+
+    fig, ax : matplotlib Figure and Axes
+    """
+
+    _, density, edges, centers = make_enhancer_density_segments(
+        enhancer_hits=enhancer_hits,
+        plot_window_kb=plot_window_kb,
+        bin_width_kb=bin_width_kb,
+        fountain_id_col=fountain_id_col,
+        enhancer_id_col=enhancer_id_col,
+        start_col=start_col,
+        end_col=end_col,
+        center_col=center_col,
+        use_intervals=use_intervals,
+    )
+
+    density = np.asarray(density, dtype=float)
+    centers = np.asarray(centers, dtype=float)
+
+    valid = np.isfinite(centers) & np.isfinite(density)
+
+    x_data = centers[valid]
+    y_data = density[valid]
+
+    if len(x_data) < 5:
+        raise ValueError(
+            "Недостаточно точек для гауссовского фита."
+        )
+
+    if np.nanmax(y_data) <= 0:
+        raise ValueError(
+            "Распределение не содержит ненулевых значений."
+        )
+
+    # ----------------------------------------
+    # Начальные оценки параметров
+    # ----------------------------------------
+
+    background_0 = float(np.nanpercentile(y_data, 10))
+    excess = np.clip(y_data - background_0, 0, None)
+
+    amplitude_0 = float(
+        max(np.nanmax(y_data) - background_0, 1.0)
+    )
+
+    if np.sum(excess) > 0:
+        mu_0 = float(
+            np.sum(x_data * excess) / np.sum(excess)
+        )
+
+        sigma_0 = float(
+            np.sqrt(
+                np.sum(
+                    excess * (x_data - mu_0) ** 2
+                )
+                / np.sum(excess)
+            )
+        )
+    else:
+        mu_0 = float(x_data[np.nanargmax(y_data)])
+        sigma_0 = plot_window_kb / 4
+
+    sigma_0 = max(sigma_0, bin_width_kb)
+
+    p0 = [
+        amplitude_0,
+        mu_0,
+        sigma_0,
+        max(background_0, 0),
+    ]
+
+    lower_bounds = [
+        0,
+        -plot_window_kb,
+        bin_width_kb / 2,
+        0,
+    ]
+
+    upper_bounds = [
+        np.inf,
+        plot_window_kb,
+        2 * plot_window_kb,
+        np.inf,
+    ]
+
+    # ----------------------------------------
+    # Фит
+    # ----------------------------------------
+
+    if weighted_fit:
+        y_error = np.sqrt(y_data + 1.0)
+    else:
+        y_error = None
+
+    popt, pcov = curve_fit(
+        gaussian_with_background,
+        x_data,
+        y_data,
+        p0=p0,
+        bounds=(lower_bounds, upper_bounds),
+        sigma=y_error,
+        absolute_sigma=False,
+        maxfev=50_000,
+    )
+
+    amplitude, mu, sigma, background = popt
+
+    parameter_se = np.sqrt(
+        np.maximum(np.diag(pcov), 0)
+    )
+
+    amplitude_se, mu_se, sigma_se, background_se = parameter_se
+
+    # ----------------------------------------
+    # Диагностика качества фита
+    # ----------------------------------------
+
+    y_pred = gaussian_with_background(
+        x_data,
+        *popt,
+    )
+
+    residuals = y_data - y_pred
+
+    rmse = float(
+        np.sqrt(np.mean(residuals**2))
+    )
+
+    ss_res = np.sum(residuals**2)
+    ss_tot = np.sum(
+        (y_data - np.mean(y_data)) ** 2
+    )
+
+    if ss_tot > 0:
+        r_squared = float(1 - ss_res / ss_tot)
+    else:
+        r_squared = np.nan
+
+    # ----------------------------------------
+    # Гладкая fitted-кривая
+    # ----------------------------------------
+
+    x_curve = np.linspace(
+        -plot_window_kb,
+        plot_window_kb,
+        1000,
+    )
+
+    y_curve = gaussian_with_background(
+        x_curve,
+        *popt,
+    )
+
+    # ----------------------------------------
+    # График
+    # ----------------------------------------
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(7, 5))
+    else:
+        fig = ax.figure
+
+    ax.bar(
+        centers,
+        density,
+        width=np.diff(edges),
+        align="center",
+        alpha=0.5,
+        label="Experimental distribution",
+    )
+
+    ax.plot(
+        x_curve,
+        y_curve,
+        linewidth=2,
+        label="Gaussian fit",
+    )
+
+    ax.axvline(
+        mu,
+        linestyle="--",
+        linewidth=1
+    )
+
+
+    ax.legend()
+    ax.grid(alpha=0.2)
+
+    fig.tight_layout()
+
+    result = {
+        "amplitude": float(amplitude),
+        "mu_kb": float(mu),
+        "sigma_kb": float(sigma),
+        "background": float(background),
+
+        "amplitude_se": float(amplitude_se),
+        "mu_se_kb": float(mu_se),
+        "sigma_se_kb": float(sigma_se),
+        "background_se": float(background_se),
+
+        "rmse": rmse,
+        "r_squared": r_squared,
+
+        "density": density,
+        "edges": edges,
+        "centers": centers,
+
+        "x_curve": x_curve,
+        "y_curve": y_curve,
+
+        "covariance": pcov,
+    }
+
+    return result, fig, ax
+    
+def plot_enhancer_vs_no_enhancer_separate(
+    agg_with,
+    agg_without,
+    enhancer_hits_with=None,
+    enhancer_hits_without=None,
+    res=5_000,
+    signal_vmin=0.5,
+    signal_vmax=1.6,
+    title_with=None,
+    title_without=None,
+    output_png_with=None,
+    output_png_without=None,
+    cmap="coolwarm",
+    dpi=600,
+    enhancer_density_bin_kb=5,
+    enhancer_density_cmap="Greys",
+    enhancer_density_lw=8,
+    enhancer_density_alpha=0.95,
+    enhancer_density_use_intervals=True,
+    show_enhancer_density_colorbar=True,
+):
+    n = agg_with.shape[0]
+    bin_kb = res / 1000
+    coords_kb = make_centered_coords(n, bin_kb)
+
+    extent = [
+        coords_kb.min(),
+        coords_kb.max(),
+        coords_kb.max(),
+        coords_kb.min(),
+    ]
+
+    plot_window_kb = max(abs(coords_kb.min()), abs(coords_kb.max()))
+
+    # Общая нормировка плотности для двух картинок,
+    # чтобы цвета были сравнимы.
+    density_vmax = None
+
+    density_precomputed = {}
+
+    for label, hits in [
+        ("with", enhancer_hits_with),
+        ("without", enhancer_hits_without),
+    ]:
+        if hits is None:
+            continue
+
+        segments, density, edges, centers = make_enhancer_density_segments(
+            hits,
+            plot_window_kb=plot_window_kb,
+            bin_width_kb=enhancer_density_bin_kb,
+            use_intervals=enhancer_density_use_intervals,
+        )
+
+        density_precomputed[label] = {
+            "segments": segments,
+            "density": density,
+            "edges": edges,
+            "centers": centers,
+        }
+
+        local_max = np.nanmax(density) if len(density) else 0
+
+        if density_vmax is None:
+            density_vmax = local_max
+        else:
+            density_vmax = max(density_vmax, local_max)
+
+    if density_vmax is None or density_vmax <= 0:
+        density_vmax = 1.0
+
+    density_norm = Normalize(vmin=0, vmax=density_vmax)
+
+    def plot_one(Z, title=None, output_png=None, density_data=None):
+        fig, ax = plt.subplots(figsize=(8, 8))
+
+        im = ax.imshow(
+            Z,
+            origin="upper",
+            extent=extent,
+            aspect="equal",
+            interpolation="nearest",
+            cmap=cmap,
+            vmin=signal_vmin,
+            vmax=signal_vmax,
+        )
+
+        ax.axline(
+            (0, 0),
+            slope=1,
+            linestyle="--",
+            linewidth=1,
+            color="black",
+            alpha=0.5,
+        )
+
+        ax.axline(
+            (0, 0),
+            slope=-1,
+            linestyle=":",
+            linewidth=1,
+            color="black",
+            alpha=0.5,
+        )
+
+        # ----------------------------
+        # Enhancer density on main diagonal
+        # ----------------------------
+        if density_data is not None:
+            segments = density_data["segments"]
+            density = density_data["density"]
+
+            # Чтобы нулевые бины не закрашивали диагональ
+            nonzero = density > 0
+
+            segments_nonzero = [
+                seg for seg, keep in zip(segments, nonzero) if keep
+            ]
+            density_nonzero = density[nonzero]
+
+            if len(segments_nonzero) > 0:
+                lc = LineCollection(
+                    segments_nonzero,
+                    cmap=enhancer_density_cmap,
+                    norm=density_norm,
+                    linewidths=enhancer_density_lw,
+                    alpha=enhancer_density_alpha,
+                    zorder=10,
+                    capstyle="butt",
+                )
+                lc.set_array(density_nonzero)
+                ax.add_collection(lc)
+
+                if show_enhancer_density_colorbar:
+                    cbar_enh = plt.colorbar(
+                        lc,
+                        ax=ax,
+                        fraction=0.046,
+                        pad=0.10,
+                    )
+                    cbar_enh.set_label("Enhancer density", fontsize=14)
+                    cbar_enh.ax.tick_params(labelsize=13)
+
+        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.ax.tick_params(labelsize=15)
+
+        ax.tick_params(axis="both", which="major", labelsize=16)
+        ax.tick_params(axis="both", which="minor", labelsize=16)
+
+        # ax.set_xlabel("Distance from fountain base, kb", fontsize=18)
+        # ax.set_ylabel("Distance from fountain base, kb", fontsize=18)
+
+        # if title is not None:
+        #     ax.set_title(title, fontsize=18)
+
+        plt.tight_layout()
+
+        if output_png is not None:
+            fig.savefig(output_png, bbox_inches="tight", dpi=dpi)
+
+        return fig, ax
+
+    fig_with, ax_with = plot_one(
+        agg_with,
+        title=title_with or "Fountains with enhancer",
+        output_png=output_png_with,
+        density_data=density_precomputed.get("with"),
+    )
+
+    fig_without, ax_without = plot_one(
+        agg_without,
+        title=title_without or "Fountains without enhancer",
+        output_png=output_png_without,
+        density_data=density_precomputed.get("without"),
+    )
+
+    return (fig_with, ax_with), (fig_without, ax_without), density_precomputed
+    
+    
+def single_loop_relative_kernel(
+    l,
+    r,
+    x_grid,
+    y_grid,
+    g0,
+):
+    """
+    Relative 3D contact kernel for one fixed loop.
+
+    Loop anchors:
+        (-l, +r)
+
+    Observed loci:
+        (-x, +y), x >= 0, y >= 0
+
+    Returns
+    -------
+    R : 2D array
+        Contact enrichment relative to the free-chain background.
+
+    g_loop : 2D array
+        Effective contour distance after imposing loop closure.
+
+    X, Y : 2D arrays
+        Coordinate grids.
+    """
+
+    l = float(l)
+    r = float(r)
+    g0 = float(g0)
+
+    if l < 0 or r < 0:
+        raise ValueError("l and r must be >= 0")
+
+    if g0 <= 0:
+        raise ValueError("g0 must be > 0")
+
+    L = l + r
+
+    X, Y = np.meshgrid(
+        np.asarray(x_grid, dtype=float),
+        np.asarray(y_grid, dtype=float),
+        indexing="xy",
+    )
+
+    # free genomic/contour separation
+    S = X + Y
+
+    # no finite loop -> no loop-induced enrichment
+    if L <= 0:
+        R = np.ones_like(S)
+        return R, S.copy(), X, Y
+
+    # overlap of observed interval [-x, +y]
+    # with loop interval [-l, +r]
+    Q = np.minimum(X, l) + np.minimum(Y, r)
+
+    # effective contour distance in the looped polymer
+    g_loop = S - Q**2 / L
+
+    # numerical protection
+    g_loop = np.maximum(g_loop, 0.0)
+
+    # enrichment relative to free chain
+    R = (
+        (g0 + S)
+        /
+        (g0 + g_loop)
+    ) ** 1.5
+
+    return R, g_loop, X, Y
+    
+    
+def contact_map_3d_mc(
+    l_grid,
+    r_grid,
+    A,
+    x_grid,
+    y_grid,
+    g0,
+    n_samples=2000,
+    random_state=1,
+    batch_size=200,
+):
+    """
+    Monte-Carlo estimate of the O/E-like contact map
+
+        P_OE(x,y) = E_A[ R(x,y | l,r) ]
+
+    where
+
+        R = ((g0 + s) / (g0 + g_loop))^(3/2)
+
+    and
+
+        g_loop = s - q^2/L.
+
+    A is interpreted as a density over the (l,r) grid.
+    """
+
+    l_grid = np.asarray(l_grid, dtype=float)
+    r_grid = np.asarray(r_grid, dtype=float)
+    A = np.asarray(A, dtype=float)
+
+    x_grid = np.asarray(x_grid, dtype=float)
+    y_grid = np.asarray(y_grid, dtype=float)
+
+    if A.shape != (len(l_grid), len(r_grid)):
+        raise ValueError(
+            f"A.shape={A.shape}, expected "
+            f"({len(l_grid)}, {len(r_grid)})"
+        )
+
+    if g0 <= 0:
+        raise ValueError("g0 must be > 0")
+
+    rng = np.random.default_rng(random_state)
+
+    # ------------------------------------------------------------
+    # approximate cell areas
+    # ------------------------------------------------------------
+    dl = np.gradient(l_grid)
+    dr = np.gradient(r_grid)
+
+    cell_area = np.outer(dl, dr)
+
+    weights = np.maximum(A, 0.0) * cell_area
+
+    total = np.sum(weights)
+
+    if total <= 0:
+        raise ValueError("A has zero positive total weight")
+
+    prob = (weights / total).ravel()
+
+    # ------------------------------------------------------------
+    # sample extrusion states
+    # ------------------------------------------------------------
+    flat_idx = rng.choice(
+        prob.size,
+        size=n_samples,
+        replace=True,
+        p=prob,
+    )
+
+    i_idx, j_idx = np.unravel_index(
+        flat_idx,
+        A.shape,
+    )
+
+    l_samples = l_grid[i_idx]
+    r_samples = r_grid[j_idx]
+
+    # ------------------------------------------------------------
+    # output coordinates
+    # ------------------------------------------------------------
+    X, Y = np.meshgrid(
+        x_grid,
+        y_grid,
+        indexing="xy",
+    )
+
+    S = X + Y
+
+    P_sum = np.zeros_like(S, dtype=float)
+
+    # ------------------------------------------------------------
+    # process samples in batches
+    # ------------------------------------------------------------
+    for start in range(0, n_samples, batch_size):
+
+        stop = min(
+            start + batch_size,
+            n_samples,
+        )
+
+        l = l_samples[start:stop, None, None]
+        r = r_samples[start:stop, None, None]
+
+        L = l + r
+
+        # default: no-loop states give R=1
+        valid_loop = L > 0
+
+        Q = (
+            np.minimum(X[None, :, :], l)
+            +
+            np.minimum(Y[None, :, :], r)
+        )
+
+        g_loop = (
+            S[None, :, :]
+            -
+            Q**2 / np.maximum(L, 1e-15)
+        )
+
+        g_loop = np.maximum(g_loop, 0.0)
+
+        R = (
+            (g0 + S[None, :, :])
+            /
+            (g0 + g_loop)
+        ) ** 1.5
+
+        # exactly zero-size loop -> background R=1
+        R = np.where(
+            valid_loop,
+            R,
+            1.0,
+        )
+
+        P_sum += np.sum(R, axis=0)
+
+    P = P_sum / n_samples
+
+    return {
+        "P": P,
+        "X": X,
+        "Y": Y,
+        "l_samples": l_samples,
+        "r_samples": r_samples,
+        "g0": g0,
+        "n_samples": n_samples,
+    }
+    
+    
+def contact_map_from_kernel_array_3d_mc(
+    l_grid,
+    r_grid,
+    A_kernel,
+    left_grid=None,
+    right_grid=None,
+    xmax=0.25,
+    n_map=100,
+
+    rho_mu=0.0,
+    rho_sigma=0.01,
+
+    # contact-kernel model
+    kernel="power",          # "delta", "power", "empirical"
+    beta=1.5,                # only for kernel="power"
+    g0=0.002,                # only for kernel="power"
+
+    expected_interp=None,    # only for kernel="empirical"
+    lp_kb=None,              # only for kernel="empirical"
+
+    n_samples=10_000,
+    batch_size=200,
+    random_state=1,
+
+    normalize=False,
+):
+    """
+    Monte-Carlo contact map from extrusion-state distribution A(l,r).
+
+    Common generative model
+    -----------------------
+        (l,r) ~ A(l,r)
+        f     ~ rho(f)
+
+    Loop anchors:
+        a = f - l
+        b = f + r
+
+    Observed pair:
+        x1 = -LEFT
+        x2 = RIGHT
+
+    Supported contact kernels
+    -------------------------
+
+    kernel="delta"
+        Old-model limit.
+
+        Contact is deposited only at the two loop anchors:
+
+            LEFT_anchor  = l - f
+            RIGHT_anchor = r + f
+
+        Numerically the delta function is represented by bilinear
+        deposition onto the output grid.
+
+        In the infinite-sampling / zero-grid-spacing limit this gives
+
+            P(LEFT,RIGHT)
+              = integral A(LEFT+f, RIGHT-f) rho(f) df
+
+        i.e. the old contact-map construction.
+
+    kernel="power"
+        Polymer/contact kernel
+
+            R = ((g0 + s) / (g0 + g_loop))**beta
+
+        beta=1.5 corresponds to the ideal Gaussian-chain model.
+
+    kernel="empirical"
+        Uses measured chromosome expected E(s):
+
+            R = E(g_loop) / E(s)
+
+        expected_interp must accept genomic distance in kb.
+        lp_kb is used to convert model units -> kb.
+
+    Notes
+    -----
+    A is treated as an unnormalised density. MC samples are drawn from
+    A / integral(A), and the final map is multiplied by integral(A).
+    Therefore all kernel modes implement the same A-weighted integral.
+
+    Returns
+    -------
+    P, LEFT, RIGHT
+    """
+
+    import numpy as np
+
+    # ============================================================
+    # Input preparation
+    # ============================================================
+
+    l_grid = np.asarray(l_grid, dtype=float)
+    r_grid = np.asarray(r_grid, dtype=float)
+    A = np.asarray(A_kernel, dtype=float)
+
+    if A.shape != (len(l_grid), len(r_grid)):
+        raise ValueError(
+            f"A_kernel.shape={A.shape}, expected "
+            f"({len(l_grid)}, {len(r_grid)})"
+        )
+
+    if left_grid is None:
+        left_grid = np.linspace(0.0, xmax, n_map)
+    else:
+        left_grid = np.asarray(left_grid, dtype=float)
+
+    if right_grid is None:
+        right_grid = np.linspace(0.0, xmax, n_map)
+    else:
+        right_grid = np.asarray(right_grid, dtype=float)
+
+    if len(left_grid) < 2 or len(right_grid) < 2:
+        raise ValueError("left_grid and right_grid must contain >= 2 points.")
+
+    kernel = str(kernel).lower()
+
+    allowed_kernels = {"delta", "power", "empirical"}
+
+    if kernel not in allowed_kernels:
+        raise ValueError(
+            f"kernel must be one of {allowed_kernels}; got {kernel!r}"
+        )
+
+    if rho_sigma < 0:
+        raise ValueError("rho_sigma must be >= 0.")
+
+    # ------------------------------------------------------------
+    # Validate kernel-specific parameters
+    # ------------------------------------------------------------
+
+    if kernel == "power":
+        beta = float(beta)
+        g0 = float(g0)
+
+        if beta <= 0:
+            raise ValueError("For kernel='power', beta must be > 0.")
+
+        if g0 <= 0:
+            raise ValueError("For kernel='power', g0 must be > 0.")
+
+    if kernel == "empirical":
+        if expected_interp is None:
+            raise ValueError(
+                "For kernel='empirical', expected_interp is required."
+            )
+
+        if lp_kb is None:
+            raise ValueError(
+                "For kernel='empirical', lp_kb is required."
+            )
+
+        if lp_kb <= 0:
+            raise ValueError("lp_kb must be > 0.")
+
+    # ============================================================
+    # Distribution over extrusion states A(l,r)
+    # ============================================================
+
+    rng = np.random.default_rng(random_state)
+
+    dl = np.gradient(l_grid)
+    dr = np.gradient(r_grid)
+
+    cell_area = np.outer(dl, dr)
+
+    # Sampling requires non-negative weights.
+    A_positive = np.maximum(A, 0.0)
+
+    weights = A_positive * cell_area
+    A_mass = np.sum(weights)
+
+    if not np.isfinite(A_mass) or A_mass <= 0:
+        raise ValueError("A_kernel has zero or invalid positive mass.")
+
+    prob = (weights / A_mass).ravel()
+
+    flat_idx = rng.choice(
+        prob.size,
+        size=n_samples,
+        replace=True,
+        p=prob,
+    )
+
+    i_idx, j_idx = np.unravel_index(
+        flat_idx,
+        A.shape,
+    )
+
+    l_samples = l_grid[i_idx]
+    r_samples = r_grid[j_idx]
+
+    # ============================================================
+    # Loading-site distribution rho(f)
+    # ============================================================
+
+    if rho_sigma > 0:
+        f_samples = rng.normal(
+            loc=rho_mu,
+            scale=rho_sigma,
+            size=n_samples,
+        )
+    else:
+        f_samples = np.full(
+            n_samples,
+            rho_mu,
+            dtype=float,
+        )
+
+    # ============================================================
+    # Output coordinate grid
+    # ============================================================
+
+    RIGHT, LEFT = np.meshgrid(
+        right_grid,
+        left_grid,
+        indexing="xy",
+    )
+
+    # ============================================================
+    # KERNEL 1: delta
+    # ============================================================
+    #
+    # Each sampled loop contributes contact only at its anchors.
+    #
+    #     x1 = f - l
+    #     x2 = f + r
+    #
+    # therefore:
+    #
+    #     LEFT  = -x1 = l - f
+    #     RIGHT =  x2 = r + f
+    #
+    # We use bilinear deposition rather than nearest-bin histogram.
+    # This reduces pixelisation noise while tending to the same
+    # delta-function limit.
+    # ============================================================
+
+    if kernel == "delta":
+
+        left_anchor = l_samples - f_samples
+        right_anchor = r_samples + f_samples
+
+        # Delta deposition currently assumes uniform output grids.
+        dleft = np.diff(left_grid)
+        dright = np.diff(right_grid)
+
+        if not np.allclose(dleft, dleft[0]):
+            raise ValueError(
+                "kernel='delta' currently requires uniform left_grid."
+            )
+
+        if not np.allclose(dright, dright[0]):
+            raise ValueError(
+                "kernel='delta' currently requires uniform right_grid."
+            )
+
+        dl_map = dleft[0]
+        dr_map = dright[0]
+
+        # Continuous coordinates -> fractional grid indices
+        u = (left_anchor - left_grid[0]) / dl_map
+        v = (right_anchor - right_grid[0]) / dr_map
+
+        valid = (
+            np.isfinite(u)
+            & np.isfinite(v)
+            & (u >= 0)
+            & (u <= len(left_grid) - 1)
+            & (v >= 0)
+            & (v <= len(right_grid) - 1)
+        )
+
+        u = u[valid]
+        v = v[valid]
+
+        i0 = np.floor(u).astype(int)
+        j0 = np.floor(v).astype(int)
+
+        # Handle samples exactly on the last grid point.
+        i0 = np.clip(i0, 0, len(left_grid) - 2)
+        j0 = np.clip(j0, 0, len(right_grid) - 2)
+
+        fu = u - i0
+        fv = v - j0
+
+        P = np.zeros(
+            (len(left_grid), len(right_grid)),
+            dtype=float,
+        )
+
+        # Bilinear "cloud-in-cell" deposition.
+        np.add.at(
+            P,
+            (i0, j0),
+            (1.0 - fu) * (1.0 - fv),
+        )
+
+        np.add.at(
+            P,
+            (i0 + 1, j0),
+            fu * (1.0 - fv),
+        )
+
+        np.add.at(
+            P,
+            (i0, j0 + 1),
+            (1.0 - fu) * fv,
+        )
+
+        np.add.at(
+            P,
+            (i0 + 1, j0 + 1),
+            fu * fv,
+        )
+
+        # Convert MC counts into a 2D density and restore
+        # the total mass of A.
+        P *= (
+            A_mass
+            / n_samples
+            / (dl_map * dr_map)
+        )
+
+        if normalize:
+            pmax = np.nanmax(P)
+            if np.isfinite(pmax) and pmax > 0:
+                P = P / pmax
+
+        return P, LEFT, RIGHT
+
+    # ============================================================
+    # KERNELS 2/3: power / empirical
+    # ============================================================
+
+    x1 = -LEFT
+    x2 = RIGHT
+
+    # Observed genomic separation
+    S = x2 - x1      # = LEFT + RIGHT
+
+    P_sum = np.zeros_like(
+        S,
+        dtype=float,
+    )
+
+    # Empirical denominator is independent of extrusion state,
+    # so calculate it only once.
+    if kernel == "empirical":
+
+        S_kb = S * lp_kb
+        E_S = expected_interp(S_kb)
+
+        if np.any(~np.isfinite(E_S)):
+            raise ValueError(
+                "expected_interp returned non-finite values for S."
+            )
+
+        if np.any(E_S <= 0):
+            raise ValueError(
+                "expected_interp must return positive expected values."
+            )
+
+    # ============================================================
+    # Monte-Carlo integration
+    # ============================================================
+
+    for start in range(
+        0,
+        n_samples,
+        batch_size,
+    ):
+
+        stop = min(
+            start + batch_size,
+            n_samples,
+        )
+
+        l = l_samples[start:stop, None, None]
+        r = r_samples[start:stop, None, None]
+        f = f_samples[start:stop, None, None]
+
+        loop_len = l + r
+
+        # Loop anchors in genomic coordinates
+        a = f - l
+        b = f + r
+
+        # --------------------------------------------------------
+        # Overlap between observed interval [x1,x2]
+        # and loop interval [a,b]
+        # --------------------------------------------------------
+
+        q = np.maximum(
+            0.0,
+            np.minimum(
+                x2[None, :, :],
+                b,
+            )
+            -
+            np.maximum(
+                x1[None, :, :],
+                a,
+            ),
+        )
+
+        safe_L = np.maximum(
+            loop_len,
+            1e-15,
+        )
+
+        # Brownian-bridge effective genomic separation
+        g_loop = (
+            S[None, :, :]
+            -
+            q**2 / safe_L
+        )
+
+        # Numerical protection
+        g_loop = np.maximum(
+            g_loop,
+            0.0,
+        )
+
+        # ========================================================
+        # POWER-LAW KERNEL
+        # ========================================================
+
+        if kernel == "power":
+
+            R = (
+                (
+                    g0
+                    + S[None, :, :]
+                )
+                /
+                (
+                    g0
+                    + g_loop
+                )
+            ) ** beta
+
+        # ========================================================
+        # EMPIRICAL EXPECTED KERNEL
+        # ========================================================
+
+        elif kernel == "empirical":
+
+            g_loop_kb = (
+                g_loop * lp_kb
+            )
+
+            E_g = expected_interp(
+                g_loop_kb
+            )
+
+            if np.any(~np.isfinite(E_g)):
+                raise ValueError(
+                    "expected_interp returned non-finite values "
+                    "for g_loop."
+                )
+
+            R = (
+                E_g
+                /
+                E_S[None, :, :]
+            )
+
+        # --------------------------------------------------------
+        # Degenerate loop -> no polymer enrichment
+        # --------------------------------------------------------
+
+        R = np.where(
+            loop_len > 0,
+            R,
+            1.0,
+        )
+
+        # s = 0 is the diagonal itself.
+        R = np.where(
+            S[None, :, :] > 0,
+            R,
+            1.0,
+        )
+
+        P_sum += np.sum(
+            R,
+            axis=0,
+        )
+
+    # MC expectation multiplied by integral A(l,r) dl dr.
+    #
+    # This makes the mathematical convention consistent with
+    # kernel="delta".
+    P = (
+        A_mass
+        * P_sum
+        / n_samples
+    )
+
+    if normalize:
+        pmax = np.nanmax(P)
+
+        if np.isfinite(pmax) and pmax > 0:
+            P = P / pmax
+
+    return P, LEFT, RIGHT
+
+
+def build_empirical_expected_interpolator(
+    dist_kb,
+    expected,
+    min_dist_kb=None,
+    max_dist_kb=None,
+):
+    """
+    Строит log-log интерполятор chromosome expected E(s).
+
+    За пределами допустимого диапазона значение прижимается
+    к ближайшей границе, без экстраполяции.
+    """
+
+    dist_kb = np.asarray(dist_kb, dtype=float)
+    expected = np.asarray(expected, dtype=float)
+
+    valid = (
+        np.isfinite(dist_kb)
+        & np.isfinite(expected)
+        & (dist_kb > 0)
+        & (expected > 0)
+    )
+
+    d = dist_kb[valid]
+    e = expected[valid]
+
+    order = np.argsort(d)
+    d = d[order]
+    e = e[order]
+
+    if min_dist_kb is None:
+        min_dist_kb = d.min()
+
+    if max_dist_kb is None:
+        max_dist_kb = d.max()
+
+    keep = (
+        (d >= min_dist_kb)
+        & (d <= max_dist_kb)
+    )
+
+    d = d[keep]
+    e = e[keep]
+
+    if len(d) < 3:
+        raise ValueError("Too few expected points after filtering.")
+
+    log_d = np.log(d)
+    log_e = np.log(e)
+
+    def E_interp(s_kb):
+        s = np.asarray(s_kb, dtype=float)
+
+        # Не пытаемся экстраполировать expected в область,
+        # где эксперимент его не разрешает.
+        s_clip = np.clip(
+            s,
+            d.min(),
+            d.max(),
+        )
+
+        log_result = np.interp(
+            np.log(s_clip),
+            log_d,
+            log_e,
+        )
+
+        return np.exp(log_result)
+
+    return E_interp
+    
+    
+def single_loop_empirical_kernel(
+    l_kb,
+    r_kb,
+    x_grid_kb,
+    y_grid_kb,
+    E_interp,
+):
+    """
+    Empirical relative contact kernel:
+
+        R = E(g_loop) / E(s)
+
+    Все координаты здесь сразу в kb.
+    """
+
+    X, Y = np.meshgrid(
+        np.asarray(x_grid_kb, dtype=float),
+        np.asarray(y_grid_kb, dtype=float),
+        indexing="xy",
+    )
+
+    L = l_kb + r_kb
+    S = X + Y
+
+    if L <= 0:
+        return np.ones_like(S), S.copy(), X, Y
+
+    Q = (
+        np.minimum(X, l_kb)
+        +
+        np.minimum(Y, r_kb)
+    )
+
+    g_loop = S - Q**2 / L
+    g_loop = np.maximum(g_loop, 0.0)
+
+    R = E_interp(g_loop) / E_interp(S)
+
+    # origin: s=0 не имеет смысла как Hi-C separation
+    R[S <= 0] = 1.0
+
+    return R, g_loop, X, Y
+    
+    
+"""Weighted spatial correlation of an empirical aggregate Hi-C fountain.
+
+Designed for aggregate_Z returned by fountain_tools_clean.build_weighted_aggregate_fountain
+with z_transform='oe'. The central pixel of aggregate_Z is treated as (0, 0) kb.
+For the upper cross-anchor fountain, the right arm is X >= 0 and the left
+arm is -Y >= 0 (so the plotted matrix has X >= 0, Y <= 0).
+
+There are two distinct quantities:
+  r_pearson_xy     - standard weighted Pearson correlation of (X, Y).
+  rho_origin_xy    - normalized cross-moment about a specified reference point.
+The same quantities in left/right arm coordinates have the opposite sign.
+Changing the origin alone does not change Pearson r; changing the centered
+window changes which pixels contribute and can change both quantities.
+"""
+from collections.abc import Mapping
+from typing import Any
+
+import numpy as np
+
+
+def _fountain_grid(Z: np.ndarray, res: float):
+    if Z.ndim != 2:
+        raise ValueError("aggregate_Z must be a 2D matrix")
+    if res <= 0 or not np.isfinite(res):
+        raise ValueError("res must be a positive bin size in bp")
+    nrows, ncols = Z.shape
+    x_kb = (np.arange(ncols, dtype=float) - (ncols - 1) / 2) * (res / 1000)
+    y_kb = (np.arange(nrows, dtype=float) - (nrows - 1) / 2) * (res / 1000)
+    return np.meshgrid(x_kb, y_kb)
+
+
+def _smooth_nan_safe(Z, sigma):
+    """Gaussian smoothing with finite-value normalization (no NaN leakage)."""
+    if sigma <= 0:
+        return Z
+    from scipy.ndimage import gaussian_filter
+    finite = np.isfinite(Z)
+    numerator = gaussian_filter(np.where(finite, Z, 0.0), sigma=sigma)
+    denominator = gaussian_filter(finite.astype(float), sigma=sigma)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(denominator > 1e-9, numerator / denominator, np.nan)
+
+
+def _finite_coordinate_pair(values):
+    """Whether a candidate contains two finite coordinates."""
+    try:
+        arr = np.asarray(values, dtype=float)
+    except (ValueError, TypeError):
+        return False
+    return bool(arr.shape == (2,) and np.all(np.isfinite(arr)))
+
+
+def estimate_empirical_fountain_peak(
+    aggregate_Z,
+    *,
+    res: float = 5_000,
+    search_center_xy_kb: tuple[float, float] = (40.0, -40.0),
+    search_half_window_kb: float = 50.0,
+    peak_quantile: float = 0.80,
+    oe_baseline: float = 1.0,
+    smooth_sigma_bins: float = 1.0,
+    diag_exclusion_kb: float = 10.0,
+    upper_cross_quadrant: bool = True,
+) -> dict[str, Any]:
+    """Estimate the peak directly from O/E pixels, without a Gaussian fit.
+
+    The reported center is the excess-signal-weighted centroid of the top
+    ``peak_quantile`` fraction of positive O/E excess after smoothing.
+    Search is confined to a square around ``search_center_xy_kb`` and, by
+    default, the upper cross-anchor quadrant (X >= 0, Y <= 0).
+
+    This is an empirical center of the *strongest* fountain signal, not the
+    maximum of a fitted Gaussian and not a special reference for Pearson r.
+    """
+    if np.ma.isMaskedArray(aggregate_Z):
+        Z = np.asarray(aggregate_Z.filled(np.nan), dtype=float)
+    else:
+        Z = np.asarray(aggregate_Z, dtype=float)
+    X, Y = _fountain_grid(Z, res)
+    if not _finite_coordinate_pair(search_center_xy_kb):
+        raise ValueError("search_center_xy_kb must be a finite (x_kb,y_kb) pair")
+    if not np.isfinite(search_half_window_kb) or search_half_window_kb <= 0:
+        raise ValueError("search_half_window_kb must be positive")
+    if not (0 < peak_quantile < 1):
+        raise ValueError("peak_quantile must be between 0 and 1")
+    if not np.isfinite(smooth_sigma_bins) or smooth_sigma_bins < 0:
+        raise ValueError("smooth_sigma_bins must be non-negative")
+    if not np.isfinite(diag_exclusion_kb) or diag_exclusion_kb < 0:
+        raise ValueError("diag_exclusion_kb must be non-negative")
+    if not np.isfinite(oe_baseline):
+        raise ValueError("oe_baseline must be finite")
+
+    Z_smooth = _smooth_nan_safe(Z, smooth_sigma_bins)
+    sx, sy = map(float, search_center_xy_kb)
+    region = (np.isfinite(Z_smooth)
+              & (np.abs(X - sx) <= search_half_window_kb + 1e-9)
+              & (np.abs(Y - sy) <= search_half_window_kb + 1e-9))
+    if upper_cross_quadrant:
+        region &= (X >= 0) & (Y <= 0)
+    if diag_exclusion_kb:
+        region &= np.abs(X - Y) >= diag_exclusion_kb
+
+    signal = np.maximum(Z_smooth - oe_baseline, 0.0)
+    positive = region & (signal > 0)
+    if not np.any(positive):
+        raise ValueError(
+            "Could not detect a peak: no positive O/E excess in the chosen "
+            "search window. Try peak_search_center_xy_kb / "
+            "peak_search_half_window_kb, lower oe_baseline, or set "
+            "peak_xy_kb manually."
+        )
+    threshold = float(np.quantile(signal[positive], peak_quantile))
+    top = positive & (signal >= threshold)
+    weights = signal[top] - threshold
+    if float(weights.sum()) <= 0:
+        # Equal-valued maxima are still legitimate peak pixels.
+        weights = signal[top]
+    px = float(np.average(X[top], weights=weights))
+    py = float(np.average(Y[top], weights=weights))
+    return {
+        "peak_xy_kb": (px, py),
+        "n_positive_pixels": int(positive.sum()),
+        "n_top_pixels": int(top.sum()),
+        "peak_quantile": float(peak_quantile),
+        "peak_threshold_excess": threshold,
+        "search_center_xy_kb": (sx, sy),
+        "search_half_window_kb": float(search_half_window_kb),
+        "smooth_sigma_bins": float(smooth_sigma_bins),
+    }
+
+
+def _resolve_center(center, peak_xy_kb):
+    if isinstance(center, str):
+        kind = center.lower().strip()
+        if kind == "base":
+            return 0.0, 0.0, "base"
+        if kind in ("peak", "fountain"):
+            if peak_xy_kb is None:
+                raise ValueError(
+                    "For center='peak', pass peak_xy_kb=(hic_peak_x_kb, hic_peak_y_kb)."
+                )
+            center = peak_xy_kb
+            name = "peak"
+        else:
+            raise ValueError("center must be 'base', 'peak', or (x_kb, y_kb)")
+    else:
+        name = "custom"
+    values = np.asarray(center, dtype=float)
+    if values.shape != (2,) or not np.all(np.isfinite(values)):
+        raise ValueError("The chosen center must contain two finite coordinates in kb")
+    return float(values[0]), float(values[1]), name
+
+
+def empirical_fountain_correlation(
+    aggregate_Z,
+    *,
+    res: float = 5_000,
+    center: str | tuple[float, float] = "base",
+    peak_xy_kb: tuple[float, float] | None = None,
+    peak_search_center_xy_kb: tuple[float, float] = (40.0, -40.0),
+    peak_search_half_window_kb: float = 50.0,
+    peak_quantile: float = 0.80,
+    peak_smooth_sigma_bins: float = 1.0,
+    half_window_kb: float = 80,
+    oe_baseline: float = 1.0,
+    signal_mode: str = "excess",
+    upper_cross_quadrant: bool = True,
+    diag_exclusion_kb: float = 10,
+    smooth_sigma_bins: float = 0,
+    min_pixels: int = 6,
+    return_mask: bool = False,
+) -> dict[str, Any]:
+    """Calculate spatial correlations of aggregate Hi-C fountain intensity.
+
+    Parameters
+    ----------
+    aggregate_Z : 2D array
+        Aggregate O/E contact map (as in the user's notebook). The central
+        pixel represents the genomic base of the fountain.
+    res : float
+        Hi-C bin resolution in bp, e.g. 5000.
+    center : {'base', 'peak'} or (x_kb, y_kb)
+        Reference point AND center of a square selection window.
+        'base' = (0,0), 'peak' = peak_xy_kb if valid, otherwise a peak
+        estimated directly from the aggregate O/E matrix.
+    peak_xy_kb : pair or None
+        Peak location, e.g. from fit_agg. If None or (nan, nan), the
+        empirical peak is estimated from aggregate_Z without Gaussian fit.
+    peak_search_center_xy_kb : pair
+        Approximate location used for automatic peak detection; default
+        (40, -40) kb, as in the user's notebook.
+    peak_search_half_window_kb : float
+        Half-width of automatic peak search region (default 50 kb).
+    peak_quantile : float
+        Use the top fraction (1 - peak_quantile) of positive smoothed O/E excess.
+    peak_smooth_sigma_bins : float
+        Gaussian smoothing for automatic peak localization (not necessarily
+        for the subsequent correlation calculation).
+    half_window_kb : float
+        Half-width of the square selection window in both axes. A value of 80
+        selects |X-cx| <= 80 and |Y-cy| <= 80 kb (before other masks).
+    oe_baseline : float
+        O/E background level (default 1).
+    signal_mode : {'excess', 'raw'}
+        excess: weights = max(Z - oe_baseline, 0); recommended for O/E.
+        raw: weights = max(Z, 0); background contributes to the moment.
+    upper_cross_quadrant : bool
+        If True, restrict to X >= 0 and Y <= 0 (cross-anchor fountain).
+    diag_exclusion_kb : float
+        Exclude genomic diagonal |X-Y| < this value in kb (0 disables).
+    smooth_sigma_bins : float
+        Optional Gaussian smoothing of the raw O/E map before calculating
+        intensities (0 means no smoothing). NaNs are treated safely.
+    min_pixels : int
+        Minimum number of pixels with positive weight.
+    return_mask : bool
+        Include arrays for diagnostic plotting. Omit for compact return.
+
+    Returns
+    -------
+    dict
+        r_pearson_xy: weighted Pearson coefficient in plotted X,Y coordinates.
+        r_pearson_arms: correlation of right X and left -Y arm distances.
+        rho_origin_xy: normalized second cross-moment w.r.t chosen center;
+            unlike Pearson r, this depends on the specified origin even for
+            an unchanged selection of pixels.
+        rho_origin_arms: same anchored coefficient in arm coordinates.
+        centroid_xy_kb, center_xy_kb, n_pixels, n_weighted_pixels,
+        effective_weighted_pixels, total_signal_weight, and window metadata.
+
+    Important
+    ---------
+    The 'origin' coefficients are not Pearson correlations. The weighted
+    Pearson coefficient is translation-invariant for a fixed pixel selection.
+    Changing the selection center changes the selected pixels, which may
+    also change Pearson r.
+    """
+    if np.ma.isMaskedArray(aggregate_Z):
+        Z = np.asarray(aggregate_Z.filled(np.nan), dtype=float)
+    else:
+        Z = np.asarray(aggregate_Z, dtype=float)
+    X, Y = _fountain_grid(Z, res)
+    if not np.isfinite(half_window_kb) or half_window_kb <= 0:
+        raise ValueError("half_window_kb must be positive")
+    if not np.isfinite(diag_exclusion_kb) or diag_exclusion_kb < 0:
+        raise ValueError("diag_exclusion_kb must be non-negative")
+    if not np.isfinite(smooth_sigma_bins) or smooth_sigma_bins < 0:
+        raise ValueError("smooth_sigma_bins must be non-negative")
+    if signal_mode not in ("excess", "raw"):
+        raise ValueError("signal_mode must be 'excess' or 'raw'")
+    peak_details = None
+    peak_source = None
+    if isinstance(center, str) and center.strip().lower() in ("peak", "fountain"):
+        if _finite_coordinate_pair(peak_xy_kb):
+            peak_source = "provided"
+        else:
+            peak_details = estimate_empirical_fountain_peak(
+                Z, res=res,
+                search_center_xy_kb=peak_search_center_xy_kb,
+                search_half_window_kb=peak_search_half_window_kb,
+                peak_quantile=peak_quantile,
+                oe_baseline=oe_baseline,
+                smooth_sigma_bins=peak_smooth_sigma_bins,
+                diag_exclusion_kb=diag_exclusion_kb,
+                upper_cross_quadrant=upper_cross_quadrant,
+            )
+            peak_xy_kb = peak_details["peak_xy_kb"]
+            peak_source = "estimated_from_aggregate_Z"
+
+    cx, cy, center_label = _resolve_center(center, peak_xy_kb)
+    Z = _smooth_nan_safe(Z, smooth_sigma_bins)
+
+    mask = (
+        np.isfinite(Z)
+        & (np.abs(X - cx) <= half_window_kb + 1e-9)
+        & (np.abs(Y - cy) <= half_window_kb + 1e-9)
+    )
+    if upper_cross_quadrant:
+        mask &= (X >= 0) & (Y <= 0)
+    if diag_exclusion_kb:
+        mask &= np.abs(X - Y) >= diag_exclusion_kb
+
+    weights = np.maximum(Z - oe_baseline, 0.0) if signal_mode == "excess" else np.maximum(Z, 0.0)
+    weighted_mask = mask & (weights > 0)
+    n_pixels = int(np.sum(mask))
+    n_weighted = int(np.sum(weighted_mask))
+    if n_weighted < min_pixels:
+        raise ValueError(
+            f"Only {n_weighted} positive-weight pixels found "
+            f"(threshold {min_pixels}); consider a larger half_window_kb, "
+            "less restrictive masks, or checking the O/E baseline."
+        )
+
+    w = weights[weighted_mask]
+    x = X[weighted_mask]
+    y = Y[weighted_mask]
+    W = float(w.sum())
+    mean_x = float(np.dot(w, x) / W)
+    mean_y = float(np.dot(w, y) / W)
+    dx, dy = x - mean_x, y - mean_y
+    sxx = float(np.dot(w, dx * dx))
+    syy = float(np.dot(w, dy * dy))
+    sxy = float(np.dot(w, dx * dy))
+    if sxx <= 0 or syy <= 0:
+        raise ValueError("Cannot calculate Pearson correlation: zero spatial variance")
+    pearson_xy = float(np.clip(sxy / np.sqrt(sxx * syy), -1, 1))
+
+    ax, ay = x - cx, y - cy
+    Sxx = float(np.dot(w, ax * ax))
+    Syy = float(np.dot(w, ay * ay))
+    Sxy = float(np.dot(w, ax * ay))
+    rho_origin_xy = (
+        float(np.clip(Sxy / np.sqrt(Sxx * Syy), -1, 1))
+        if Sxx > 0 and Syy > 0 else float("nan")
+    )
+
+    result = {
+        "center": center_label,
+        "center_xy_kb": (cx, cy),
+        "peak_source": peak_source,
+        "peak_estimate_details": peak_details,
+        "half_window_kb": float(half_window_kb),
+        "res_bp": float(res),
+        "n_pixels": n_pixels,
+        "n_weighted_pixels": n_weighted,
+        "effective_weighted_pixels": float(W**2 / np.dot(w, w)),
+        "total_signal_weight": W,
+        "centroid_xy_kb": (mean_x, mean_y),
+        "r_pearson_xy": pearson_xy,
+        "r_pearson_arms": -pearson_xy,
+        "rho_origin_xy": rho_origin_xy,
+        "rho_origin_arms": -rho_origin_xy,
+        "upper_cross_quadrant": bool(upper_cross_quadrant),
+        "diag_exclusion_kb": float(diag_exclusion_kb),
+        "signal_mode": signal_mode,
+        "oe_baseline": float(oe_baseline),
+        "smooth_sigma_bins": float(smooth_sigma_bins),
+    }
+    if return_mask:
+        result["mask"] = mask
+        result["weighted_mask"] = weighted_mask
+        result["X_grid_kb"] = X
+        result["Y_grid_kb"] = Y
+        result["Z_used"] = Z
+        result["weights"] = weights
+    return result
+
+
+def plot_fountain_correlation_window(
+    aggregate_Z, result, *, res: float = 5_000, ax=None,
+    vmin: float = 0.8, vmax: float = 1.4, cmap: str = "coolwarm",
+):
+    """Diagnostic plot showing exactly where the square window is selected.
+
+    Pass the dictionary produced by empirical_fountain_correlation. This
+    visualization assumes the same res as the correlation call.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    if np.ma.isMaskedArray(aggregate_Z):
+        Z = np.asarray(aggregate_Z.filled(np.nan), dtype=float)
+    else:
+        Z = np.asarray(aggregate_Z, dtype=float)
+    X, Y = _fountain_grid(Z, res)
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 5.7))
+    else:
+        fig = ax.figure
+    mesh = ax.pcolormesh(X, Y, Z, shading="nearest", cmap=cmap,
+                         vmin=vmin, vmax=vmax)
+    cx, cy = result["center_xy_kb"]
+    h = result["half_window_kb"]
+    rect = Rectangle((cx-h, cy-h), 2*h, 2*h, fill=False,
+                     edgecolor="black", linewidth=2, linestyle="--")
+    ax.add_patch(rect)
+    ax.scatter([0], [0], marker="+", color="black", s=100, label="base")
+    ax.scatter([cx], [cy], marker="x", color="magenta", s=65,
+               label=f"{result['center']} / window center")
+    mean_x, mean_y = result["centroid_xy_kb"]
+    ax.scatter([mean_x], [mean_y], marker="o", facecolors="none",
+               edgecolors="gold", s=75, linewidths=2, label="weighted centroid")
+    ax.axhline(0, color="gray", lw=0.6, alpha=0.5)
+    ax.axvline(0, color="gray", lw=0.6, alpha=0.5)
+    ax.set(xlabel="X (kb)", ylabel="Y (kb)",
+           title=f"r(X,Y)={result['r_pearson_xy']:.3f} | center={result['center']}")
+    ax.set_aspect("equal")
+    ax.set_xlim(X.min(), X.max())
+    ax.set_ylim(Y.max(), Y.min())  # match notebook's inverted vertical axis
+    ax.legend(loc="best", fontsize=8)
+    fig.colorbar(mesh, ax=ax, label="Hi-C aggregate (O/E)")
+    return fig, ax
+
+
+__all__ = [
+    "empirical_fountain_correlation",
+    "estimate_empirical_fountain_peak",
+    "plot_fountain_correlation_window",
+]
+
